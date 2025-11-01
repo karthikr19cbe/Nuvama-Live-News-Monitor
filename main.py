@@ -45,7 +45,10 @@ def get_headlines():
     """Get headlines from Nuvama"""
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
+            browser = p.chromium.launch(
+                executable_path="/nix/store/qa9cnw4v5xkxyip6mb9kxqfq1z4x2dx1-chromium-138.0.7204.100/bin/chromium",
+                headless=True
+            )
             page = browser.new_page()
 
             print("Loading page...")

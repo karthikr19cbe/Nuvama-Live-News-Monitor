@@ -3,6 +3,7 @@ modules = ["python-3.11"]
 
 [nix]
 channel = "stable-25_05"
+packages = ["gitFull", "playwright-driver", "nspr", "nss", "dbus", "atk", "at-spi2-atk", "cups", "xorg.libxcb", "libxkbcommon", "at-spi2-core", "xorg.libXcomposite", "xorg.libXdamage", "xorg.libXfixes", "mesa", "cairo", "pango", "alsa-lib", "chromium"]
 
 [unitTest]
 language = "python3"
@@ -16,3 +17,26 @@ deploymentTarget = "cloudrun"
 
 [agent]
 expertMode = true
+
+[workflows]
+runButton = "Project"
+
+[[workflows.workflow]]
+name = "Project"
+mode = "parallel"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "news-monitor"
+
+[[workflows.workflow]]
+name = "news-monitor"
+author = "agent"
+
+[workflows.workflow.metadata]
+outputType = "console"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS=true python main.py"
