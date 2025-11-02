@@ -217,6 +217,7 @@ initial_headlines = get_headlines()
 initial_seen = set()
 for h in initial_headlines:
     initial_seen.add(hashlib.md5(h.encode()).hexdigest())
+    save_headline_to_db(h)  # Save initial headlines to database
 save_seen(initial_seen)
 print(f"Baseline set: {len(initial_headlines)} current headlines\n")
 

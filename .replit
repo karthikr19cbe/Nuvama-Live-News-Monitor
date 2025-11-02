@@ -35,8 +35,17 @@ name = "news-monitor"
 author = "agent"
 
 [workflows.workflow.metadata]
-outputType = "console"
+outputType = "webview"
 
 [[workflows.workflow.tasks]]
 task = "shell.exec"
-args = "PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS=true python main.py"
+args = "PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS=true python run_all.py"
+waitForPort = 5000
+
+[[ports]]
+localPort = 5000
+externalPort = 80
+
+[[ports]]
+localPort = 32939
+externalPort = 3000
