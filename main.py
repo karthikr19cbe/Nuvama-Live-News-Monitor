@@ -17,6 +17,7 @@ NUVAMA_URL = "https://www.nuvamawealth.com/live-news"
 CHECK_INTERVAL_SECONDS = 60  # Check every 60 seconds
 
 HISTORY_FILE = "headlines_seen.json"
+HEADLINES_DB_FILE = "headlines_database.json"
 
 
 def send_telegram(headline):
@@ -139,6 +140,33 @@ def save_seen(seen_ids):
         print(f"Save error: {e}")
 
 
+def load_headlines_db():
+    """Load headlines database"""
+    try:
+        with open(HEADLINES_DB_FILE, 'r') as f:
+            return json.load(f)
+    except:
+        return []
+
+
+def save_headline_to_db(headline):
+    """Save a headline to the database with timestamp"""
+    try:
+        db = load_headlines_db()
+        entry = {
+            "headline": headline,
+            "timestamp": datetime.now().strftime('%Y-%m-%d %I:%M:%S %p'),
+            "date": datetime.now().strftime('%Y-%m-%d')
+        }
+        db.insert(0, entry)  # Add to beginning
+        # Keep only last 100 headlines
+        db = db[:100]
+        with open(HEADLINES_DB_FILE, 'w') as f:
+            json.dump(db, f, indent=2)
+    except Exception as e:
+        print(f"Database save error: {e}")
+
+
 def check_and_notify():
     """Check for new headlines and send notifications"""
     print("=" * 60)
@@ -162,6 +190,7 @@ def check_and_notify():
         print(f"***** {len(new_ones)} NEW HEADLINES *****")
         for headline, h_id in new_ones:
             print(f"Sending: {headline[:70]}...")
+            save_headline_to_db(headline)  # Save to database
             if send_telegram(headline):
                 time.sleep(2)
 
