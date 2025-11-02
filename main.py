@@ -6,13 +6,14 @@ Runs continuously, checking every 1 minute
 import hashlib
 import time
 import json
+import os
 from datetime import datetime
 import requests
 from playwright.sync_api import sync_playwright
 
 # CONFIGURATION
-TELEGRAM_TOKEN = "8224764009:AAHG5AGUm5LD3KD9xwSyo2GRRTCl1wPuLBw"
-CHAT_ID = "678820723"
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8224764009:AAHG5AGUm5LD3KD9xwSyo2GRRTCl1wPuLBw")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "678820723")
 NUVAMA_URL = "https://www.nuvamawealth.com/live-news"
 CHECK_INTERVAL_SECONDS = 60  # Check every 60 seconds
 
