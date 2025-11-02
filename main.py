@@ -78,6 +78,23 @@ def get_headlines():
                 if len(line_clean) < 30 or len(line_clean) > 600:
                     continue
 
+                # Skip JavaScript/code patterns
+                code_patterns = ['function(', 'var ', '{', '};', '=>', '&&', '||', 
+                                '!=', '==', '++', '[]', 'return ', 'if(', 'for(',
+                                'while(', '.push(', '.on(', 'typeof', 'null',
+                                'undefined', 'console.', 'window.', 'document.',
+                                '$(', 'jquery', 'dataLayer', '_gaq']
+                if any(pattern in line_clean for pattern in code_patterns):
+                    continue
+                
+                # Skip lines with too many special characters (code/HTML)
+                special_chars = line_clean.count('{') + line_clean.count('}') + \
+                               line_clean.count('(') + line_clean.count(')') + \
+                               line_clean.count('[') + line_clean.count(']') + \
+                               line_clean.count('<') + line_clean.count('>')
+                if special_chars > 5:
+                    continue
+
                 line_lower = line_clean.lower()
                 if any(skip in line_lower for skip in skip_keywords):
                     strong_indicators = [
