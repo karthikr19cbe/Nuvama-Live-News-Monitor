@@ -44,7 +44,7 @@ def send_telegram(headline):
 
 
 def get_headlines():
-    """Get headlines from Nuvama with timestamps"""
+    """Get headlines from Nuvama with timestamps (handles both absolute and relative timestamps)"""
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(
@@ -64,11 +64,10 @@ def get_headlines():
             headlines = []
             
             import re
-            # Pattern to match timestamps like "03 Nov 06:35 AM"
-            timestamp_pattern = r'^\d{2}\s+[A-Za-z]{3}\s+\d{2}:\d{2}\s+[AP]M$'
-            
-            # Categories to skip
-            category_words = ['commentary', 'equity', 'global', 'fixed income', 'commodities']
+            # Pattern to match absolute timestamps like "03 Nov 06:35 AM"
+            absolute_timestamp_pattern = r'^\d{2}\s+[A-Za-z]{3}\s+\d{2}:\d{2}\s+[AP]M$'
+            # Pattern to match relative timestamps like "15 mins ago", "1 hour ago"
+            relative_timestamp_pattern = r'^\d+\s+(min|mins|hour|hours)\s+ago$'
 
             # Navigation/menu items to skip (exact matches only)
             skip_exact = [
@@ -88,7 +87,8 @@ def get_headlines():
                 'empowering our clients', 'mon-fri', 'all rights reserved',
                 'sebi scores', 'broking services offered by', 'registered office',
                 'corporate office', 'financial products distribution',
-                'most important terms', 'prevent unauthorized'
+                'most important terms', 'prevent unauthorized', 'healthy financial journey',
+                'switch to old website', 'clicking the button below'
             ]
             
             # Legal patterns
@@ -107,8 +107,11 @@ def get_headlines():
                 if i + 1 < len(lines):
                     next_line = lines[i + 1].strip()
                     
-                    # Check if next line is a timestamp
-                    if re.match(timestamp_pattern, next_line):
+                    # Check if next line is a timestamp (absolute OR relative)
+                    is_absolute_timestamp = re.match(absolute_timestamp_pattern, next_line)
+                    is_relative_timestamp = re.match(relative_timestamp_pattern, next_line)
+                    
+                    if is_absolute_timestamp or is_relative_timestamp:
                         # This line might be a headline
                         
                         # Length filter
@@ -176,20 +179,39 @@ def save_headline_to_db(headline_text, publish_timestamp):
     try:
         db = load_headlines_db()
         
-        # Parse the timestamp from "03 Nov 06:35 AM" format
-        # Convert to "2025-11-03 06:35 AM" format
-        from datetime import datetime as dt
+        # Parse the timestamp - handle both absolute and relative formats
+        from datetime import datetime as dt, timedelta
+        import re
+        
         try:
-            # Parse "03 Nov 06:35 AM" to datetime
-            parsed_time = dt.strptime(publish_timestamp, '%d %b %I:%M %p')
-            # Add current year
-            current_year = dt.now().year
-            parsed_time = parsed_time.replace(year=current_year)
-            # Format as needed
-            formatted_timestamp = parsed_time.strftime('%Y-%m-%d %I:%M %p')
-            formatted_date = parsed_time.strftime('%Y-%m-%d')
-        except:
+            # Check if it's a relative timestamp like "15 mins ago" or "1 hour ago"
+            relative_match = re.match(r'^(\d+)\s+(min|mins|hour|hours)\s+ago$', publish_timestamp)
+            
+            if relative_match:
+                # It's a relative timestamp - calculate actual time
+                amount = int(relative_match.group(1))
+                unit = relative_match.group(2)
+                
+                now = dt.now()
+                if unit in ['min', 'mins']:
+                    actual_time = now - timedelta(minutes=amount)
+                else:  # hours
+                    actual_time = now - timedelta(hours=amount)
+                
+                formatted_timestamp = actual_time.strftime('%Y-%m-%d %I:%M %p')
+                formatted_date = actual_time.strftime('%Y-%m-%d')
+            else:
+                # It's an absolute timestamp like "03 Nov 06:35 AM"
+                parsed_time = dt.strptime(publish_timestamp, '%d %b %I:%M %p')
+                # Add current year
+                current_year = dt.now().year
+                parsed_time = parsed_time.replace(year=current_year)
+                # Format as needed
+                formatted_timestamp = parsed_time.strftime('%Y-%m-%d %I:%M %p')
+                formatted_date = parsed_time.strftime('%Y-%m-%d')
+        except Exception as parse_error:
             # Fallback to current time if parsing fails
+            print(f"Timestamp parse error: {parse_error} for '{publish_timestamp}'")
             formatted_timestamp = datetime.now().strftime('%Y-%m-%d %I:%M:%S %p')
             formatted_date = datetime.now().strftime('%Y-%m-%d')
         
