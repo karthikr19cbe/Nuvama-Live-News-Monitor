@@ -63,60 +63,79 @@ def get_headlines():
             lines = all_text.split('\n')
             headlines = []
 
-            skip_keywords = [
-                'nifty', 'sensex', 'login', 'sign up', 'live news', 'all',
-                'results', 'block deals', 'equity', 'commentary', 'global',
-                'fixed income', 'commodities', 'stocks in news', 'updates',
-                'search', 'menu', 'trader', 'nuvama', 'solutions', 'markets',
-                'tools', 'support', 'customers', 'healthy financial',
-                'get started', 'why nuvama', 'support center', '1800',
-                'helpdesk', 'feedback', 'mins ago', 'nov', 'oct', 'pm', 'am',
-                'visit', 'locate'
+            # Navigation/menu items to skip (exact matches only)
+            skip_exact = [
+                'live news', 'all', 'results', 'block deals', 'equity', 
+                'commentary', 'global', 'fixed income', 'commodities', 
+                'solutions', 'markets', 'tools & resources',
+                'support', 'login / sign up', 'search', '0 updates'
+            ]
+            
+            # Generic words that should be filtered (when appearing alone or with common words)
+            skip_patterns = [
+                'sign up', 'get started', 'why nuvama', 'support center', 
+                'helpdesk', 'feedback', 'visit', 'locate', 'healthy financial',
+                'customer', 'trader', 'menu', 'investor charter', 
+                'dispute resolution portal', 'issue with our website',
+                'issue is not resolved', 'join ', 'million customers',
+                'empowering our clients', 'mon-fri', 'all rights reserved',
+                'sebi scores', 'broking services offered by', 'registered office',
+                'corporate office', 'financial products distribution',
+                'most important terms', 'prevent unauthorized'
             ]
 
             for line in lines:
                 line_clean = line.strip()
 
-                if len(line_clean) < 30 or len(line_clean) > 600:
+                # Length filter - allow longer headlines
+                if len(line_clean) < 30 or len(line_clean) > 1500:
                     continue
 
                 # Skip JavaScript/code patterns
-                code_patterns = ['function(', 'var ', '{', '};', '=>', '&&', '||', 
-                                '!=', '==', '++', '[]', 'return ', 'if(', 'for(',
-                                'while(', '.push(', '.on(', 'typeof', 'null',
+                code_patterns = ['function(', 'var ', '=>', 'return ', 'typeof', 
                                 'undefined', 'console.', 'window.', 'document.',
-                                '$(', 'jquery', 'dataLayer', '_gaq']
+                                'jquery', 'dataLayer', '_gaq', '.push(', 'addEventListener']
                 if any(pattern in line_clean for pattern in code_patterns):
                     continue
                 
-                # Skip lines with too many special characters (code/HTML)
+                # Skip lines with excessive special characters (code/HTML)
                 special_chars = line_clean.count('{') + line_clean.count('}') + \
-                               line_clean.count('(') + line_clean.count(')') + \
                                line_clean.count('[') + line_clean.count(']') + \
                                line_clean.count('<') + line_clean.count('>')
-                if special_chars > 5:
+                if special_chars > 10:
                     continue
 
                 line_lower = line_clean.lower()
-                if any(skip in line_lower for skip in skip_keywords):
-                    strong_indicators = [
-                        'rupees', 'ebitda', 'revenue', 'profit', 'crore',
-                        'billion'
-                    ]
-                    if not any(ind in line_lower for ind in strong_indicators):
+                
+                # Skip exact navigation menu items
+                if line_lower in skip_exact:
+                    continue
+                    
+                # Skip if line is mostly just time/date
+                if line_lower.count(' mins ago') > 0 or line_lower.count(' hours ago') > 0:
+                    continue
+                
+                # Always skip legal/compliance/footer content regardless of length
+                legal_patterns = ['broking services offered by', 'registered office', 
+                                 'corporate office', 'all rights reserved', 'sebi scores',
+                                 'prevent unauthorized', 'financial products distribution',
+                                 'most important terms', 'investor charter',
+                                 'dispute resolution', 'issue is not resolved',
+                                 'empowering our clients', 'dedicated to empowering']
+                if any(pattern in line_lower for pattern in legal_patterns):
+                    continue
+                
+                # Skip short lines that are just navigation patterns
+                if any(pattern in line_lower for pattern in skip_patterns):
+                    if len(line_clean) < 80:  # Short lines with nav words are likely menu items
                         continue
-
-                financial_indicators = [
-                    'RUPEES', '%', 'YOY', 'Q2', 'Q3', 'Q4', 'FY', 'EBITDA',
-                    'REVENUE', 'SALES', 'PROFIT', 'CRORE', 'BILLION', 'MARGIN',
-                    'GROWTH', 'CONS NET'
-                ]
-
-                if any(ind in line_clean for ind in financial_indicators):
-                    headlines.append(line_clean)
+                
+                # If we got here, it's likely a headline - add it!
+                headlines.append(line_clean)
 
             print(f"Found {len(headlines)} headlines")
-            return headlines[:25]
+            # Return all headlines, don't slice them here
+            return headlines
 
     except Exception as e:
         print(f"Scraping error: {e}")
