@@ -68,6 +68,8 @@ def get_headlines():
             absolute_timestamp_pattern = r'^\d{2}\s+[A-Za-z]{3}\s+\d{2}:\d{2}\s+[AP]M$'
             # Pattern to match relative timestamps like "15 mins ago", "1 hour ago"
             relative_timestamp_pattern = r'^\d+\s+(min|mins|hour|hours)\s+ago$'
+            # Pattern to match "Just Now"
+            just_now_pattern = r'^Just\s+Now$'
 
             # Navigation/menu items to skip (exact matches only)
             skip_exact = [
@@ -107,11 +109,12 @@ def get_headlines():
                 if i + 1 < len(lines):
                     next_line = lines[i + 1].strip()
                     
-                    # Check if next line is a timestamp (absolute OR relative)
+                    # Check if next line is a timestamp (absolute, relative, or "Just Now")
                     is_absolute_timestamp = re.match(absolute_timestamp_pattern, next_line)
                     is_relative_timestamp = re.match(relative_timestamp_pattern, next_line)
+                    is_just_now = re.match(just_now_pattern, next_line, re.IGNORECASE)
                     
-                    if is_absolute_timestamp or is_relative_timestamp:
+                    if is_absolute_timestamp or is_relative_timestamp or is_just_now:
                         # This line might be a headline
                         
                         # Length filter
@@ -178,36 +181,44 @@ def load_headlines_db():
 
 
 def save_headline_to_db(headline_text, publish_timestamp):
-    """Save a headline to the database with actual publish timestamp"""
+    """Save a headline to the database with actual publish timestamp in IST"""
     try:
         db = load_headlines_db()
         
         # Parse the timestamp - handle both absolute and relative formats
-        from datetime import datetime as dt, timedelta
+        from datetime import datetime as dt, timedelta, timezone
         import re
         
+        # IST timezone offset (UTC+5:30)
+        IST = timezone(timedelta(hours=5, minutes=30))
+        
         try:
+            # Check if it's "Just Now"
+            if re.match(r'^Just\s+Now$', publish_timestamp.strip(), re.IGNORECASE):
+                # Use current IST time
+                now_ist = dt.now(IST)
+                formatted_timestamp = now_ist.strftime('%d %b %I:%M %p')
+                formatted_date = now_ist.strftime('%Y-%m-%d')
             # Check if it's a relative timestamp like "15 mins ago" or "1 hour ago"
-            relative_match = re.match(r'^(\d+)\s+(min|mins|hour|hours)\s+ago$', publish_timestamp.strip())
-            
-            if relative_match:
-                # It's a relative timestamp - calculate actual publish time
+            elif relative_match := re.match(r'^(\d+)\s+(min|mins|hour|hours)\s+ago$', publish_timestamp.strip()):
+                # It's a relative timestamp - calculate actual publish time in IST
                 amount = int(relative_match.group(1))
                 unit = relative_match.group(2)
                 
-                now = dt.now()
+                # Get current time in IST
+                now_ist = dt.now(IST)
                 if unit in ['min', 'mins']:
-                    actual_time = now - timedelta(minutes=amount)
+                    actual_time = now_ist - timedelta(minutes=amount)
                 else:  # hours
-                    actual_time = now - timedelta(hours=amount)
+                    actual_time = now_ist - timedelta(hours=amount)
                 
                 formatted_timestamp = actual_time.strftime('%d %b %I:%M %p')
                 formatted_date = actual_time.strftime('%Y-%m-%d')
             else:
-                # It's an absolute timestamp like "03 Nov 06:35 AM"
+                # It's an absolute timestamp like "03 Nov 06:35 AM" (already in IST from Nuvama)
                 parsed_time = dt.strptime(publish_timestamp.strip(), '%d %b %I:%M %p')
                 # Add current year
-                current_year = dt.now().year
+                current_year = dt.now(IST).year
                 parsed_time = parsed_time.replace(year=current_year)
                 # Format consistently
                 formatted_timestamp = parsed_time.strftime('%d %b %I:%M %p')
@@ -216,7 +227,7 @@ def save_headline_to_db(headline_text, publish_timestamp):
             # Fallback to original timestamp if parsing fails
             print(f"Timestamp parse error: {parse_error} for '{publish_timestamp}'")
             formatted_timestamp = publish_timestamp
-            formatted_date = datetime.now().strftime('%Y-%m-%d')
+            formatted_date = dt.now(IST).strftime('%Y-%m-%d')
         
         entry = {
             "headline": headline_text,
