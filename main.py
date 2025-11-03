@@ -25,7 +25,7 @@ def send_telegram(headline):
     """Send one headline to Telegram"""
     try:
         headline_clean = headline.strip()
-        message = f"📰 <b>NUVAMA NEWS</b>\n\n{headline_clean}\n\n<a href='{NUVAMA_URL}'>View All</a>"
+        message = headline_clean
 
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         response = requests.post(url,
