@@ -139,6 +139,9 @@ def get_headlines():
                 
                 i += 1
 
+            # Reverse list so newest headlines get processed last (and end up at index 0)
+            headlines.reverse()
+            
             print(f"Found {len(headlines)} headlines")
             return headlines
 
