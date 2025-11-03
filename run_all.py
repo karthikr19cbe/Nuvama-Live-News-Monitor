@@ -22,10 +22,13 @@ def run_web_server():
     """Run the Flask web server"""
     while True:
         try:
-            subprocess.run([sys.executable, "app.py"], check=False)
+            result = subprocess.run([sys.executable, "app.py"], check=False)
+            # If Flask exits cleanly, break the loop (don't restart)
+            if result.returncode == 0:
+                break
         except Exception as e:
             print(f"Web server error: {e}")
-            time.sleep(10)
+        time.sleep(10)
 
 
 if __name__ == "__main__":
