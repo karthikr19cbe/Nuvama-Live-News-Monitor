@@ -252,6 +252,8 @@ def check_and_notify():
 
     if new_ones:
         print(f"***** {len(new_ones)} NEW HEADLINES *****")
+        # Reverse the list so oldest headlines are sent first (chronological order in Telegram)
+        new_ones.reverse()
         for headline_text, timestamp, h_id in new_ones:
             print(f"Sending: {headline_text[:70]}...")
             save_headline_to_db(headline_text, timestamp)  # Save to database with actual timestamp
