@@ -44,7 +44,7 @@ def send_telegram(headline):
 
 
 def get_headlines():
-    """Get headlines from Nuvama"""
+    """Get headlines from Nuvama with timestamps"""
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(
@@ -62,6 +62,13 @@ def get_headlines():
 
             lines = all_text.split('\n')
             headlines = []
+            
+            import re
+            # Pattern to match timestamps like "03 Nov 06:35 AM"
+            timestamp_pattern = r'^\d{2}\s+[A-Za-z]{3}\s+\d{2}:\d{2}\s+[AP]M$'
+            
+            # Categories to skip
+            category_words = ['commentary', 'equity', 'global', 'fixed income', 'commodities']
 
             # Navigation/menu items to skip (exact matches only)
             skip_exact = [
@@ -71,7 +78,7 @@ def get_headlines():
                 'support', 'login / sign up', 'search', '0 updates'
             ]
             
-            # Generic words that should be filtered (when appearing alone or with common words)
+            # Generic words that should be filtered
             skip_patterns = [
                 'sign up', 'get started', 'why nuvama', 'support center', 
                 'helpdesk', 'feedback', 'visit', 'locate', 'healthy financial',
@@ -83,58 +90,53 @@ def get_headlines():
                 'corporate office', 'financial products distribution',
                 'most important terms', 'prevent unauthorized'
             ]
+            
+            # Legal patterns
+            legal_patterns = ['broking services offered by', 'registered office', 
+                             'corporate office', 'all rights reserved', 'sebi scores',
+                             'prevent unauthorized', 'financial products distribution',
+                             'most important terms', 'investor charter',
+                             'dispute resolution', 'issue is not resolved',
+                             'empowering our clients', 'dedicated to empowering']
 
-            for line in lines:
-                line_clean = line.strip()
-
-                # Length filter - allow longer headlines
-                if len(line_clean) < 30 or len(line_clean) > 1500:
-                    continue
-
-                # Skip JavaScript/code patterns
-                code_patterns = ['function(', 'var ', '=>', 'return ', 'typeof', 
-                                'undefined', 'console.', 'window.', 'document.',
-                                'jquery', 'dataLayer', '_gaq', '.push(', 'addEventListener']
-                if any(pattern in line_clean for pattern in code_patterns):
-                    continue
+            i = 0
+            while i < len(lines):
+                line_clean = lines[i].strip()
                 
-                # Skip lines with excessive special characters (code/HTML)
-                special_chars = line_clean.count('{') + line_clean.count('}') + \
-                               line_clean.count('[') + line_clean.count(']') + \
-                               line_clean.count('<') + line_clean.count('>')
-                if special_chars > 10:
-                    continue
-
-                line_lower = line_clean.lower()
-                
-                # Skip exact navigation menu items
-                if line_lower in skip_exact:
-                    continue
+                # Look for a headline followed by a timestamp
+                if i + 1 < len(lines):
+                    next_line = lines[i + 1].strip()
                     
-                # Skip if line is mostly just time/date
-                if line_lower.count(' mins ago') > 0 or line_lower.count(' hours ago') > 0:
-                    continue
+                    # Check if next line is a timestamp
+                    if re.match(timestamp_pattern, next_line):
+                        # This line might be a headline
+                        
+                        # Length filter
+                        if len(line_clean) >= 30 and len(line_clean) <= 1500:
+                            line_lower = line_clean.lower()
+                            
+                            # Skip if it's a navigation item
+                            if line_lower not in skip_exact:
+                                # Skip legal patterns
+                                if not any(pattern in line_lower for pattern in legal_patterns):
+                                    # Skip short lines with nav patterns
+                                    skip_this = False
+                                    if any(pattern in line_lower for pattern in skip_patterns):
+                                        if len(line_clean) < 80:
+                                            skip_this = True
+                                    
+                                    if not skip_this:
+                                        # This is a valid headline with timestamp
+                                        headlines.append({
+                                            'headline': line_clean,
+                                            'timestamp': next_line
+                                        })
+                                        i += 3  # Skip headline, timestamp, and category
+                                        continue
                 
-                # Always skip legal/compliance/footer content regardless of length
-                legal_patterns = ['broking services offered by', 'registered office', 
-                                 'corporate office', 'all rights reserved', 'sebi scores',
-                                 'prevent unauthorized', 'financial products distribution',
-                                 'most important terms', 'investor charter',
-                                 'dispute resolution', 'issue is not resolved',
-                                 'empowering our clients', 'dedicated to empowering']
-                if any(pattern in line_lower for pattern in legal_patterns):
-                    continue
-                
-                # Skip short lines that are just navigation patterns
-                if any(pattern in line_lower for pattern in skip_patterns):
-                    if len(line_clean) < 80:  # Short lines with nav words are likely menu items
-                        continue
-                
-                # If we got here, it's likely a headline - add it!
-                headlines.append(line_clean)
+                i += 1
 
             print(f"Found {len(headlines)} headlines")
-            # Return all headlines, don't slice them here
             return headlines
 
     except Exception as e:
@@ -169,14 +171,32 @@ def load_headlines_db():
         return []
 
 
-def save_headline_to_db(headline):
-    """Save a headline to the database with timestamp"""
+def save_headline_to_db(headline_text, publish_timestamp):
+    """Save a headline to the database with actual publish timestamp"""
     try:
         db = load_headlines_db()
+        
+        # Parse the timestamp from "03 Nov 06:35 AM" format
+        # Convert to "2025-11-03 06:35 AM" format
+        from datetime import datetime as dt
+        try:
+            # Parse "03 Nov 06:35 AM" to datetime
+            parsed_time = dt.strptime(publish_timestamp, '%d %b %I:%M %p')
+            # Add current year
+            current_year = dt.now().year
+            parsed_time = parsed_time.replace(year=current_year)
+            # Format as needed
+            formatted_timestamp = parsed_time.strftime('%Y-%m-%d %I:%M %p')
+            formatted_date = parsed_time.strftime('%Y-%m-%d')
+        except:
+            # Fallback to current time if parsing fails
+            formatted_timestamp = datetime.now().strftime('%Y-%m-%d %I:%M:%S %p')
+            formatted_date = datetime.now().strftime('%Y-%m-%d')
+        
         entry = {
-            "headline": headline,
-            "timestamp": datetime.now().strftime('%Y-%m-%d %I:%M:%S %p'),
-            "date": datetime.now().strftime('%Y-%m-%d')
+            "headline": headline_text,
+            "timestamp": formatted_timestamp,
+            "date": formatted_date
         }
         db.insert(0, entry)  # Add to beginning
         # Keep only last 100 headlines
@@ -201,17 +221,19 @@ def check_and_notify():
 
     new_ones = []
     for h in headlines:
-        h_id = hashlib.md5(h.encode()).hexdigest()
+        headline_text = h['headline']
+        timestamp = h['timestamp']
+        h_id = hashlib.md5(headline_text.encode()).hexdigest()
         if h_id not in seen_ids:
-            new_ones.append((h, h_id))
+            new_ones.append((headline_text, timestamp, h_id))
             seen_ids.add(h_id)
 
     if new_ones:
         print(f"***** {len(new_ones)} NEW HEADLINES *****")
-        for headline, h_id in new_ones:
-            print(f"Sending: {headline[:70]}...")
-            save_headline_to_db(headline)  # Save to database
-            if send_telegram(headline):
+        for headline_text, timestamp, h_id in new_ones:
+            print(f"Sending: {headline_text[:70]}...")
+            save_headline_to_db(headline_text, timestamp)  # Save to database with actual timestamp
+            if send_telegram(headline_text):
                 time.sleep(2)
 
         save_seen(seen_ids)
@@ -236,8 +258,10 @@ print("Setting baseline...")
 initial_headlines = get_headlines()
 initial_seen = set()
 for h in initial_headlines:
-    initial_seen.add(hashlib.md5(h.encode()).hexdigest())
-    save_headline_to_db(h)  # Save initial headlines to database
+    headline_text = h['headline']
+    timestamp = h['timestamp']
+    initial_seen.add(hashlib.md5(headline_text.encode()).hexdigest())
+    save_headline_to_db(headline_text, timestamp)  # Save initial headlines with actual timestamps
 save_seen(initial_seen)
 print(f"Baseline set: {len(initial_headlines)} current headlines\n")
 
