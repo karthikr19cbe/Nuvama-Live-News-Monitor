@@ -297,10 +297,11 @@ send_telegram(
     "Monitor started on Replit! Running 24/7. Each new headline arrives separately."
 )
 
-# Initial baseline
+# Initial baseline - load existing seen IDs to prevent re-sending old headlines
 print("Setting baseline...")
 initial_headlines = get_headlines()
-initial_seen = set()
+# IMPORTANT: Load existing seen IDs to preserve deduplication across restarts
+initial_seen = load_seen()  # This prevents re-sending old headlines after restart
 for h in initial_headlines:
     headline_text = h['headline']
     timestamp = h['timestamp']
@@ -310,8 +311,11 @@ for h in initial_headlines:
     headline_for_hash = re.sub(r'\([+-]?\d+\.\d+%\)', '', headline_text)
     headline_for_hash = re.sub(r'\s+', ' ', headline_for_hash).strip()
     
-    initial_seen.add(hashlib.md5(headline_for_hash.encode()).hexdigest())
-    save_headline_to_db(headline_text, timestamp)  # Save initial headlines with actual timestamps
+    h_id = hashlib.md5(headline_for_hash.encode()).hexdigest()
+    # Only save to database if this is truly a new headline (not seen before)
+    if h_id not in initial_seen:
+        save_headline_to_db(headline_text, timestamp)
+    initial_seen.add(h_id)
 save_seen(initial_seen)
 print(f"Baseline set: {len(initial_headlines)} current headlines\n")
 
