@@ -188,10 +188,10 @@ def save_headline_to_db(headline_text, publish_timestamp):
         
         try:
             # Check if it's a relative timestamp like "15 mins ago" or "1 hour ago"
-            relative_match = re.match(r'^(\d+)\s+(min|mins|hour|hours)\s+ago$', publish_timestamp)
+            relative_match = re.match(r'^(\d+)\s+(min|mins|hour|hours)\s+ago$', publish_timestamp.strip())
             
             if relative_match:
-                # It's a relative timestamp - calculate actual time
+                # It's a relative timestamp - calculate actual publish time
                 amount = int(relative_match.group(1))
                 unit = relative_match.group(2)
                 
@@ -201,21 +201,21 @@ def save_headline_to_db(headline_text, publish_timestamp):
                 else:  # hours
                     actual_time = now - timedelta(hours=amount)
                 
-                formatted_timestamp = actual_time.strftime('%Y-%m-%d %I:%M %p')
+                formatted_timestamp = actual_time.strftime('%d %b %I:%M %p')
                 formatted_date = actual_time.strftime('%Y-%m-%d')
             else:
                 # It's an absolute timestamp like "03 Nov 06:35 AM"
-                parsed_time = dt.strptime(publish_timestamp, '%d %b %I:%M %p')
+                parsed_time = dt.strptime(publish_timestamp.strip(), '%d %b %I:%M %p')
                 # Add current year
                 current_year = dt.now().year
                 parsed_time = parsed_time.replace(year=current_year)
-                # Format as needed
-                formatted_timestamp = parsed_time.strftime('%Y-%m-%d %I:%M %p')
+                # Format consistently
+                formatted_timestamp = parsed_time.strftime('%d %b %I:%M %p')
                 formatted_date = parsed_time.strftime('%Y-%m-%d')
         except Exception as parse_error:
-            # Fallback to current time if parsing fails
+            # Fallback to original timestamp if parsing fails
             print(f"Timestamp parse error: {parse_error} for '{publish_timestamp}'")
-            formatted_timestamp = datetime.now().strftime('%Y-%m-%d %I:%M:%S %p')
+            formatted_timestamp = publish_timestamp
             formatted_date = datetime.now().strftime('%Y-%m-%d')
         
         entry = {
