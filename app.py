@@ -24,6 +24,8 @@ def load_headlines():
 def index():
     """Main dashboard page"""
     headlines = load_headlines()
+    # Reverse to show most recent first
+    headlines = list(reversed(headlines))
     return render_template('dashboard.html', headlines=headlines)
 
 
@@ -31,6 +33,8 @@ def index():
 def api_headlines():
     """API endpoint for headlines"""
     headlines = load_headlines()
+    # Reverse to show most recent first
+    headlines = list(reversed(headlines))
     return jsonify(headlines)
 
 
