@@ -248,7 +248,13 @@ def check_and_notify():
     for h in headlines:
         headline_text = h['headline']
         timestamp = h['timestamp']
-        h_id = hashlib.md5(headline_text.encode()).hexdigest()
+        
+        # Remove stock price percentages for deduplication (they change constantly)
+        import re
+        headline_for_hash = re.sub(r'\([+-]?\d+\.\d+%\)', '', headline_text)
+        headline_for_hash = re.sub(r'\s+', ' ', headline_for_hash).strip()
+        
+        h_id = hashlib.md5(headline_for_hash.encode()).hexdigest()
         if h_id not in seen_ids:
             new_ones.append((headline_text, timestamp, h_id))
             seen_ids.add(h_id)
@@ -287,7 +293,13 @@ initial_seen = set()
 for h in initial_headlines:
     headline_text = h['headline']
     timestamp = h['timestamp']
-    initial_seen.add(hashlib.md5(headline_text.encode()).hexdigest())
+    
+    # Remove stock price percentages for deduplication (they change constantly)
+    import re
+    headline_for_hash = re.sub(r'\([+-]?\d+\.\d+%\)', '', headline_text)
+    headline_for_hash = re.sub(r'\s+', ' ', headline_for_hash).strip()
+    
+    initial_seen.add(hashlib.md5(headline_for_hash.encode()).hexdigest())
     save_headline_to_db(headline_text, timestamp)  # Save initial headlines with actual timestamps
 save_seen(initial_seen)
 print(f"Baseline set: {len(initial_headlines)} current headlines\n")
