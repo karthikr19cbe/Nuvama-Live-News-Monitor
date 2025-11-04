@@ -263,7 +263,10 @@ def check_and_notify():
         # Remove stock price percentages for deduplication (they change constantly)
         import re
         headline_for_hash = re.sub(r'\([+-]?\d+\.\d+%\)', '', headline_text)
+        # Normalize Nuvama's "- :" placeholder (used when no stock price)
+        headline_for_hash = re.sub(r'[-–—]\s*:\s*', ': ', headline_for_hash)
         headline_for_hash = re.sub(r'\s+', ' ', headline_for_hash).strip()
+        headline_for_hash = headline_for_hash.lower()  # Lowercase for consistency
         
         h_id = hashlib.md5(headline_for_hash.encode()).hexdigest()
         if h_id not in seen_ids:
@@ -309,7 +312,10 @@ for h in initial_headlines:
     # Remove stock price percentages for deduplication (they change constantly)
     import re
     headline_for_hash = re.sub(r'\([+-]?\d+\.\d+%\)', '', headline_text)
+    # Normalize Nuvama's "- :" placeholder (used when no stock price)
+    headline_for_hash = re.sub(r'[-–—]\s*:\s*', ': ', headline_for_hash)
     headline_for_hash = re.sub(r'\s+', ' ', headline_for_hash).strip()
+    headline_for_hash = headline_for_hash.lower()  # Lowercase for consistency
     
     h_id = hashlib.md5(headline_for_hash.encode()).hexdigest()
     # Only save to database if this is truly a new headline (not seen before)
