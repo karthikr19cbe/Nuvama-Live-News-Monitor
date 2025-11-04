@@ -1,28 +1,103 @@
 """
-Nuvama News Monitor - Replit Version
+Nuvama News Monitor - Enhanced Version with Timestamp-Based Filtering
 Runs continuously, checking every 1 minute
+Handles restarts gracefully using persistent timestamp tracking
 """
 
 import hashlib
 import time
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 import requests
 from playwright.sync_api import sync_playwright
+import re
 
 # CONFIGURATION
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8224764009:AAHG5AGUm5LD3KD9xwSyo2GRRTCl1wPuLBw")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "678820723")
 NUVAMA_URL = "https://www.nuvamawealth.com/live-news"
-CHECK_INTERVAL_SECONDS = 60  # Check every 60 seconds
+CHECK_INTERVAL_SECONDS = 60
 
+# STATE FILES
 HISTORY_FILE = "headlines_seen.json"
 HEADLINES_DB_FILE = "headlines_database.json"
+LAST_CHECK_FILE = "last_check_timestamp.json"
+ERROR_LOG_FILE = "error_log.json"
+
+# IST timezone (UTC+5:30)
+IST = timezone(timedelta(hours=5, minutes=30))
+
+
+def log_error(error_type, message, details=None):
+    """Log errors to file with timestamp"""
+    try:
+        try:
+            with open(ERROR_LOG_FILE, 'r') as f:
+                errors = json.load(f)
+        except:
+            errors = []
+        
+        error_entry = {
+            "timestamp": datetime.now(IST).isoformat(),
+            "type": error_type,
+            "message": str(message),
+            "details": details
+        }
+        errors.append(error_entry)
+        
+        # Keep only last 100 errors
+        errors = errors[-100:]
+        
+        with open(ERROR_LOG_FILE, 'w') as f:
+            json.dump(errors, f, indent=2)
+    except Exception as e:
+        print(f"Error logging failed: {e}")
+
+
+def parse_timestamp_to_datetime(publish_timestamp):
+    """
+    Convert Nuvama timestamp to IST datetime object for comparison
+    Handles: "Just Now", "15 mins ago", "2 hours ago", "03 Nov 08:26 AM"
+    Returns: datetime object in IST or None if parsing fails
+    """
+    try:
+        timestamp_str = publish_timestamp.strip()
+        
+        # Handle "Just Now"
+        if re.match(r'^Just\s+Now$', timestamp_str, re.IGNORECASE):
+            return datetime.now(IST)
+        
+        # Handle relative timestamps like "15 mins ago" or "2 hours ago"
+        relative_match = re.match(r'^(\d+)\s+(min|mins|hour|hours)\s+ago$', timestamp_str)
+        if relative_match:
+            amount = int(relative_match.group(1))
+            unit = relative_match.group(2)
+            
+            now_ist = datetime.now(IST)
+            if unit in ['min', 'mins']:
+                return now_ist - timedelta(minutes=amount)
+            else:  # hours
+                return now_ist - timedelta(hours=amount)
+        
+        # Handle absolute timestamps like "03 Nov 08:26 AM"
+        try:
+            parsed_time = datetime.strptime(timestamp_str, '%d %b %I:%M %p')
+            current_year = datetime.now(IST).year
+            # Create timezone-aware datetime in IST
+            parsed_time = parsed_time.replace(year=current_year, tzinfo=IST)
+            return parsed_time
+        except:
+            pass
+        
+        return None
+    except Exception as e:
+        log_error("timestamp_parse", f"Failed to parse timestamp: {publish_timestamp}", str(e))
+        return None
 
 
 def send_telegram(headline):
-    """Send one headline to Telegram"""
+    """Send one headline to Telegram with error handling"""
     try:
         headline_clean = headline.strip()
         message = headline_clean
@@ -37,14 +112,19 @@ def send_telegram(headline):
                                  },
                                  timeout=10)
 
-        return response.status_code == 200
+        if response.status_code == 200:
+            return True
+        else:
+            log_error("telegram_api", f"Non-200 response: {response.status_code}", headline[:100])
+            return False
     except Exception as e:
+        log_error("telegram_send", str(e), headline[:100])
         print(f"Telegram error: {e}")
         return False
 
 
 def get_headlines():
-    """Get headlines from Nuvama with timestamps (handles both absolute and relative timestamps)"""
+    """Get headlines from Nuvama with timestamps and datetime objects"""
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(
@@ -63,7 +143,6 @@ def get_headlines():
             lines = all_text.split('\n')
             headlines = []
             
-            import re
             # Pattern to match absolute timestamps like "03 Nov 06:35 AM"
             absolute_timestamp_pattern = r'^\d{2}\s+[A-Za-z]{3}\s+\d{2}:\d{2}\s+[AP]M$'
             # Pattern to match relative timestamps like "15 mins ago", "1 hour ago"
@@ -119,29 +198,35 @@ def get_headlines():
                         
                         # Length filter
                         if len(line_clean) >= 30 and len(line_clean) <= 1500:
-                            line_lower = line_clean.lower()
+                            # Skip navigation items
+                            if line_clean.lower() in skip_exact:
+                                i += 1
+                                continue
                             
-                            # Skip if it's a navigation item
-                            if line_lower not in skip_exact:
-                                # Skip legal patterns
-                                if not any(pattern in line_lower for pattern in legal_patterns):
-                                    # Skip short lines with nav patterns
-                                    skip_this = False
-                                    if any(pattern in line_lower for pattern in skip_patterns):
-                                        if len(line_clean) < 80:
-                                            skip_this = True
-                                    
-                                    if not skip_this:
-                                        # This is a valid headline with timestamp
-                                        headlines.append({
-                                            'headline': line_clean,
-                                            'timestamp': next_line
-                                        })
-                                        i += 3  # Skip headline, timestamp, and category
-                                        continue
+                            # Skip generic patterns
+                            if any(skip_word in line_clean.lower() for skip_word in skip_patterns):
+                                i += 1
+                                continue
+                            
+                            # Skip legal patterns
+                            if any(legal in line_clean.lower() for legal in legal_patterns):
+                                i += 1
+                                continue
+                            
+                            # This looks like a real headline
+                            timestamp_str = next_line
+                            datetime_obj = parse_timestamp_to_datetime(timestamp_str)
+                            
+                            headlines.append({
+                                'headline': line_clean,
+                                'timestamp': timestamp_str,
+                                'datetime': datetime_obj  # For comparison
+                            })
+                            i += 2  # Skip both headline and timestamp
+                            continue
                 
                 i += 1
-
+            
             # Reverse list so newest headlines get processed last (and end up at index 0)
             headlines.reverse()
             
@@ -149,15 +234,19 @@ def get_headlines():
             return headlines
 
     except Exception as e:
+        log_error("scraping", str(e), NUVAMA_URL)
         print(f"Scraping error: {e}")
         return []
 
 
 def load_seen():
-    """Load seen headlines"""
+    """Load seen headlines with validation"""
     try:
         with open(HISTORY_FILE, 'r') as f:
-            return set(json.load(f))
+            data = json.load(f)
+            if isinstance(data, list):
+                return set(data)
+            return set()
     except:
         return set()
 
@@ -166,16 +255,47 @@ def save_seen(seen_ids):
     """Save seen headlines"""
     try:
         with open(HISTORY_FILE, 'w') as f:
-            json.dump(list(seen_ids), f)
+            json.dump(list(seen_ids), f, indent=2)
     except Exception as e:
+        log_error("save_seen", str(e), f"Seen IDs count: {len(seen_ids)}")
         print(f"Save error: {e}")
 
 
+def load_last_check_timestamp():
+    """Load last successful check timestamp"""
+    try:
+        with open(LAST_CHECK_FILE, 'r') as f:
+            data = json.load(f)
+            timestamp_str = data.get('last_check')
+            if timestamp_str:
+                return datetime.fromisoformat(timestamp_str)
+        return None
+    except:
+        return None
+
+
+def save_last_check_timestamp():
+    """Save current timestamp as last successful check"""
+    try:
+        data = {
+            'last_check': datetime.now(IST).isoformat(),
+            'last_check_readable': datetime.now(IST).strftime('%d %b %Y %I:%M:%S %p IST')
+        }
+        with open(LAST_CHECK_FILE, 'w') as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        log_error("save_last_check", str(e), None)
+        print(f"Failed to save last check timestamp: {e}")
+
+
 def load_headlines_db():
-    """Load headlines database"""
+    """Load headlines database with validation"""
     try:
         with open(HEADLINES_DB_FILE, 'r') as f:
-            return json.load(f)
+            data = json.load(f)
+            if isinstance(data, list):
+                return data
+            return []
     except:
         return []
 
@@ -185,49 +305,14 @@ def save_headline_to_db(headline_text, publish_timestamp):
     try:
         db = load_headlines_db()
         
-        # Parse the timestamp - handle both absolute and relative formats
-        from datetime import datetime as dt, timedelta, timezone
-        import re
-        
-        # IST timezone offset (UTC+5:30)
-        IST = timezone(timedelta(hours=5, minutes=30))
-        
-        try:
-            # Check if it's "Just Now"
-            if re.match(r'^Just\s+Now$', publish_timestamp.strip(), re.IGNORECASE):
-                # Use current IST time
-                now_ist = dt.now(IST)
-                formatted_timestamp = now_ist.strftime('%d %b %I:%M %p')
-                formatted_date = now_ist.strftime('%Y-%m-%d')
-            # Check if it's a relative timestamp like "15 mins ago" or "1 hour ago"
-            elif relative_match := re.match(r'^(\d+)\s+(min|mins|hour|hours)\s+ago$', publish_timestamp.strip()):
-                # It's a relative timestamp - calculate actual publish time in IST
-                amount = int(relative_match.group(1))
-                unit = relative_match.group(2)
-                
-                # Get current time in IST
-                now_ist = dt.now(IST)
-                if unit in ['min', 'mins']:
-                    actual_time = now_ist - timedelta(minutes=amount)
-                else:  # hours
-                    actual_time = now_ist - timedelta(hours=amount)
-                
-                formatted_timestamp = actual_time.strftime('%d %b %I:%M %p')
-                formatted_date = actual_time.strftime('%Y-%m-%d')
-            else:
-                # It's an absolute timestamp like "03 Nov 06:35 AM" (already in IST from Nuvama)
-                parsed_time = dt.strptime(publish_timestamp.strip(), '%d %b %I:%M %p')
-                # Add current year
-                current_year = dt.now(IST).year
-                parsed_time = parsed_time.replace(year=current_year)
-                # Format consistently
-                formatted_timestamp = parsed_time.strftime('%d %b %I:%M %p')
-                formatted_date = parsed_time.strftime('%Y-%m-%d')
-        except Exception as parse_error:
-            # Fallback to original timestamp if parsing fails
-            print(f"Timestamp parse error: {parse_error} for '{publish_timestamp}'")
+        datetime_obj = parse_timestamp_to_datetime(publish_timestamp)
+        if datetime_obj:
+            formatted_timestamp = datetime_obj.strftime('%d %b %I:%M %p')
+            formatted_date = datetime_obj.strftime('%Y-%m-%d')
+        else:
+            # Fallback
             formatted_timestamp = publish_timestamp
-            formatted_date = dt.now(IST).strftime('%Y-%m-%d')
+            formatted_date = datetime.now(IST).strftime('%Y-%m-%d')
         
         entry = {
             "headline": headline_text,
@@ -240,13 +325,29 @@ def save_headline_to_db(headline_text, publish_timestamp):
         with open(HEADLINES_DB_FILE, 'w') as f:
             json.dump(db, f, indent=2)
     except Exception as e:
+        log_error("database_save", str(e), headline_text[:100])
         print(f"Database save error: {e}")
 
 
+def normalize_headline_for_dedup(headline_text):
+    """
+    Normalize headline for deduplication
+    Handles all known Nuvama format variations
+    """
+    # Remove stock price percentages (they change constantly)
+    text = re.sub(r'\([+-]?\d+\.\d+%\)', '', headline_text)
+    # Normalize Nuvama's "- :" placeholder (used when no stock price)
+    text = re.sub(r'[-–—]\s*:\s*', ': ', text)
+    # Collapse multiple spaces
+    text = re.sub(r'\s+', ' ', text).strip()
+    # Lowercase for case-insensitive matching
+    return text.lower()
+
+
 def check_and_notify():
-    """Check for new headlines and send notifications"""
+    """Check for new headlines and send notifications with timestamp filtering"""
     print("=" * 60)
-    print(f"Checking... {datetime.now().strftime('%Y-%m-%d %I:%M:%S %p')}")
+    print(f"Checking... {datetime.now(IST).strftime('%Y-%m-%d %I:%M:%S %p IST')}")
 
     seen_ids = load_seen()
     headlines = get_headlines()
@@ -255,74 +356,115 @@ def check_and_notify():
         print("No headlines found")
         return
 
+    # Load last check timestamp for filtering
+    last_check = load_last_check_timestamp()
+    if last_check:
+        print(f"Last check was: {last_check.strftime('%d %b %I:%M %p IST')}")
+
     new_ones = []
     for h in headlines:
         headline_text = h['headline']
         timestamp = h['timestamp']
+        datetime_obj = h['datetime']
         
-        # Remove stock price percentages for deduplication (they change constantly)
-        import re
-        headline_for_hash = re.sub(r'\([+-]?\d+\.\d+%\)', '', headline_text)
-        # Normalize Nuvama's "- :" placeholder (used when no stock price)
-        headline_for_hash = re.sub(r'[-–—]\s*:\s*', ': ', headline_for_hash)
-        headline_for_hash = re.sub(r'\s+', ' ', headline_for_hash).strip()
-        headline_for_hash = headline_for_hash.lower()  # Lowercase for consistency
+        # Normalize for deduplication
+        headline_normalized = normalize_headline_for_dedup(headline_text)
+        h_id = hashlib.md5(headline_normalized.encode()).hexdigest()
         
-        h_id = hashlib.md5(headline_for_hash.encode()).hexdigest()
         if h_id not in seen_ids:
-            new_ones.append((headline_text, timestamp, h_id))
+            new_ones.append((headline_text, timestamp, datetime_obj, h_id))
             seen_ids.add(h_id)
 
     if new_ones:
         print(f"***** {len(new_ones)} NEW HEADLINES *****")
         # Reverse the list so oldest headlines are sent first (chronological order in Telegram)
         new_ones.reverse()
-        for headline_text, timestamp, h_id in new_ones:
-            print(f"Sending: {headline_text[:70]}...")
-            save_headline_to_db(headline_text, timestamp)  # Save to database with actual timestamp
-            if send_telegram(headline_text):
-                time.sleep(2)
+        
+        for headline_text, timestamp, datetime_obj, h_id in new_ones:
+            # Check if this headline is truly newer than last check
+            should_send_alert = True
+            if last_check and datetime_obj:
+                # Only send alert if headline is newer than last check
+                if datetime_obj <= last_check:
+                    should_send_alert = False
+                    print(f"Skipping old: {headline_text[:50]}... [{timestamp}]")
+            
+            # Always save to database
+            save_headline_to_db(headline_text, timestamp)
+            
+            # Only send to Telegram if it's truly new
+            if should_send_alert:
+                print(f"Sending: {headline_text[:70]}...")
+                if send_telegram(headline_text):
+                    time.sleep(2)
 
         save_seen(seen_ids)
     else:
         print("No new headlines")
+    
+    # Update last check timestamp after successful check
+    save_last_check_timestamp()
 
 
 # Main loop
 print("=" * 60)
-print("NUVAMA NEWS MONITOR - REPLIT VERSION")
+print("NUVAMA NEWS MONITOR - ENHANCED VERSION")
 print("=" * 60)
 print(f"Checking every {CHECK_INTERVAL_SECONDS} seconds")
+print(f"IST Timezone: UTC+5:30")
 print("=" * 60 + "\n")
+
+# Check if this is a restart
+last_check = load_last_check_timestamp()
+if last_check:
+    downtime = datetime.now(IST) - last_check
+    print(f"⚠️  RESTART DETECTED")
+    print(f"Last check: {last_check.strftime('%d %b %Y %I:%M:%S %p IST')}")
+    print(f"Downtime: {downtime}")
+    print(f"Will send ONLY headlines newer than last check to Telegram\n")
+else:
+    print("🆕 FIRST RUN - Initializing baseline\n")
 
 # Send startup message
 send_telegram(
-    "Monitor started on Replit! Running 24/7. Each new headline arrives separately."
+    "🔄 Monitor restarted! Running 24/7. Only new headlines will be sent."
 )
 
-# Initial baseline - load existing seen IDs to prevent re-sending old headlines
+# Initial baseline with timestamp-based filtering
 print("Setting baseline...")
 initial_headlines = get_headlines()
-# IMPORTANT: Load existing seen IDs to preserve deduplication across restarts
-initial_seen = load_seen()  # This prevents re-sending old headlines after restart
+initial_seen = load_seen()  # Load existing seen IDs
+
 for h in initial_headlines:
     headline_text = h['headline']
     timestamp = h['timestamp']
+    datetime_obj = h['datetime']
     
-    # Remove stock price percentages for deduplication (they change constantly)
-    import re
-    headline_for_hash = re.sub(r'\([+-]?\d+\.\d+%\)', '', headline_text)
-    # Normalize Nuvama's "- :" placeholder (used when no stock price)
-    headline_for_hash = re.sub(r'[-–—]\s*:\s*', ': ', headline_for_hash)
-    headline_for_hash = re.sub(r'\s+', ' ', headline_for_hash).strip()
-    headline_for_hash = headline_for_hash.lower()  # Lowercase for consistency
+    # Normalize for deduplication
+    headline_normalized = normalize_headline_for_dedup(headline_text)
+    h_id = hashlib.md5(headline_normalized.encode()).hexdigest()
     
-    h_id = hashlib.md5(headline_for_hash.encode()).hexdigest()
-    # Only save to database if this is truly a new headline (not seen before)
-    if h_id not in initial_seen:
+    # Check if truly new based on last check timestamp
+    is_new = h_id not in initial_seen
+    should_alert = False
+    
+    if is_new and last_check and datetime_obj:
+        # Check if headline is newer than last check
+        if datetime_obj > last_check:
+            should_alert = True
+    
+    # Always add to database if not seen before
+    if is_new:
         save_headline_to_db(headline_text, timestamp)
+        if should_alert:
+            print(f"📢 New during downtime: {headline_text[:60]}...")
+            send_telegram(headline_text)
+            time.sleep(2)
+    
     initial_seen.add(h_id)
+
 save_seen(initial_seen)
+save_last_check_timestamp()
 print(f"Baseline set: {len(initial_headlines)} current headlines\n")
 
 # Run forever
@@ -335,9 +477,11 @@ while True:
         print(f"Waiting {CHECK_INTERVAL_SECONDS} seconds...\n")
         time.sleep(CHECK_INTERVAL_SECONDS)
     except KeyboardInterrupt:
-        print("\nStopped by user")
+        print("\n⚠️  Stopped by user")
+        save_last_check_timestamp()
         break
     except Exception as e:
+        log_error("main_loop", str(e), f"Check #{check_count}")
         print(f"Error: {e}")
         print("Retrying in 60 seconds...")
         time.sleep(60)
