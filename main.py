@@ -320,10 +320,9 @@ def save_headline_to_db(headline_text, publish_timestamp):
             "date": formatted_date
         }
         
-        # Append to list (newest first)
-        # Since Nuvama shows newest first and we process in that order,
-        # appending maintains the correct order
-        db.append(entry)
+        # Always insert at position 0 (newest first)
+        # This ensures new headlines always appear at the top of the dashboard
+        db.insert(0, entry)
         
         # Keep only last 100 headlines
         db = db[:100]
