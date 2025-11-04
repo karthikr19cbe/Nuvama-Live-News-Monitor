@@ -227,8 +227,8 @@ def get_headlines():
                 
                 i += 1
             
-            # Reverse list so newest headlines get processed last (and end up at index 0)
-            headlines.reverse()
+            # Don't reverse - Nuvama already shows newest headlines first
+            # Headlines will be processed in order: newest first
             
             print(f"Found {len(headlines)} headlines")
             return headlines
@@ -319,7 +319,12 @@ def save_headline_to_db(headline_text, publish_timestamp):
             "timestamp": formatted_timestamp,
             "date": formatted_date
         }
-        db.insert(0, entry)  # Add to beginning
+        
+        # Append to list (newest first)
+        # Since Nuvama shows newest first and we process in that order,
+        # appending maintains the correct order
+        db.append(entry)
+        
         # Keep only last 100 headlines
         db = db[:100]
         with open(HEADLINES_DB_FILE, 'w') as f:
@@ -377,8 +382,8 @@ def check_and_notify():
 
     if new_ones:
         print(f"***** {len(new_ones)} NEW HEADLINES *****")
-        # Reverse the list so oldest headlines are sent first (chronological order in Telegram)
-        new_ones.reverse()
+        # new_ones is already in newest-first order from Nuvama
+        # Send them in this order to Telegram (newest first)
         
         for headline_text, timestamp, datetime_obj, h_id in new_ones:
             # Check if this headline is truly newer than last check
@@ -444,7 +449,7 @@ for h in initial_headlines:
     headline_normalized = normalize_headline_for_dedup(headline_text)
     h_id = hashlib.md5(headline_normalized.encode()).hexdigest()
     
-    # Check if truly new based on last check timestamp
+    # Check if truly new (not in previous runs)
     is_new = h_id not in initial_seen
     should_alert = False
     
@@ -453,13 +458,14 @@ for h in initial_headlines:
         if datetime_obj > last_check:
             should_alert = True
     
-    # Always add to database if not seen before
-    if is_new:
-        save_headline_to_db(headline_text, timestamp)
-        if should_alert:
-            print(f"📢 New during downtime: {headline_text[:60]}...")
-            send_telegram(headline_text)
-            time.sleep(2)
+    # Always save to database to rebuild with correct order
+    save_headline_to_db(headline_text, timestamp)
+    
+    # Send alert only if truly new and newer than last check
+    if is_new and should_alert:
+        print(f"📢 New during downtime: {headline_text[:60]}...")
+        send_telegram(headline_text)
+        time.sleep(2)
     
     initial_seen.add(h_id)
 
