@@ -30,6 +30,9 @@ CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 NUVAMA_URL = "https://www.nuvamawealth.com/live-news"
 CHECK_INTERVAL_SECONDS = 60
 
+# RESULTS FILTER - skip earnings/results headlines from Telegram (still saved to dashboard)
+EXCLUDE_RESULTS_ALERTS = os.getenv("EXCLUDE_RESULTS_ALERTS", "false").lower() == "true"
+
 # STATE FILES
 HISTORY_FILE = "headlines_seen.json"
 HEADLINES_DB_FILE = "headlines_database.json"
@@ -224,13 +227,19 @@ def get_headlines():
                             # This looks like a real headline
                             timestamp_str = next_line
                             datetime_obj = parse_timestamp_to_datetime(timestamp_str)
-                            
+
+                            # Check line after timestamp for category tag (Result, Equity, etc.)
+                            category = ""
+                            if i + 2 < len(lines):
+                                category = lines[i + 2].strip()
+
                             headlines.append({
                                 'headline': line_clean,
                                 'timestamp': timestamp_str,
-                                'datetime': datetime_obj  # For comparison
+                                'datetime': datetime_obj,  # For comparison
+                                'category': category
                             })
-                            i += 2  # Skip both headline and timestamp
+                            i += 3  # Skip headline, timestamp, and category
                             continue
                 
                 i += 1
@@ -378,21 +387,22 @@ def check_and_notify():
         headline_text = h['headline']
         timestamp = h['timestamp']
         datetime_obj = h['datetime']
-        
+        category = h.get('category', '')
+
         # Normalize for deduplication
         headline_normalized = normalize_headline_for_dedup(headline_text)
         h_id = hashlib.md5(headline_normalized.encode()).hexdigest()
-        
+
         if h_id not in seen_ids:
-            new_ones.append((headline_text, timestamp, datetime_obj, h_id))
+            new_ones.append((headline_text, timestamp, datetime_obj, h_id, category))
             seen_ids.add(h_id)
 
     if new_ones:
         print(f"***** {len(new_ones)} NEW HEADLINES *****")
         # new_ones is already in newest-first order from Nuvama
         # Send them in this order to Telegram (newest first)
-        
-        for headline_text, timestamp, datetime_obj, h_id in new_ones:
+
+        for headline_text, timestamp, datetime_obj, h_id, category in new_ones:
             # Check if this headline is truly newer than last check
             should_send_alert = True
             if last_check and datetime_obj:
@@ -400,15 +410,18 @@ def check_and_notify():
                 if datetime_obj <= last_check:
                     should_send_alert = False
                     print(f"Skipping old: {headline_text[:50]}... [{timestamp}]")
-            
+
             # Always save to database
             save_headline_to_db(headline_text, timestamp)
-            
-            # Only send to Telegram if it's truly new
+
+            # Only send to Telegram if it's truly new and not filtered
             if should_send_alert:
-                print(f"Sending: {headline_text[:70]}...")
-                if send_telegram(headline_text):
-                    time.sleep(2)
+                if EXCLUDE_RESULTS_ALERTS and category.lower() == "result":
+                    print(f"Filtered [{category}]: {headline_text[:70]}...")
+                else:
+                    print(f"Sending: {headline_text[:70]}...")
+                    if send_telegram(headline_text):
+                        time.sleep(2)
 
         save_seen(seen_ids)
     else:
@@ -424,6 +437,7 @@ print("NUVAMA NEWS MONITOR - ENHANCED VERSION")
 print("=" * 60)
 print(f"Checking every {CHECK_INTERVAL_SECONDS} seconds")
 print(f"IST Timezone: UTC+5:30")
+print(f"Exclude results alerts: {EXCLUDE_RESULTS_ALERTS}")
 print("=" * 60 + "\n")
 
 # Check if this is a restart
@@ -451,29 +465,33 @@ for h in initial_headlines:
     headline_text = h['headline']
     timestamp = h['timestamp']
     datetime_obj = h['datetime']
-    
+    category = h.get('category', '')
+
     # Normalize for deduplication
     headline_normalized = normalize_headline_for_dedup(headline_text)
     h_id = hashlib.md5(headline_normalized.encode()).hexdigest()
-    
+
     # Check if truly new (not in previous runs)
     is_new = h_id not in initial_seen
     should_alert = False
-    
+
     if is_new and last_check and datetime_obj:
         # Check if headline is newer than last check
         if datetime_obj > last_check:
             should_alert = True
-    
+
     # Always save to database to rebuild with correct order
     save_headline_to_db(headline_text, timestamp)
-    
+
     # Send alert only if truly new and newer than last check
     if is_new and should_alert:
-        print(f"[ALERT] New during downtime: {headline_text[:60]}...")
-        send_telegram(headline_text)
-        time.sleep(2)
-    
+        if EXCLUDE_RESULTS_ALERTS and category.lower() == "result":
+            print(f"[FILTERED] Result skipped: {headline_text[:60]}...")
+        else:
+            print(f"[ALERT] New during downtime: {headline_text[:60]}...")
+            send_telegram(headline_text)
+            time.sleep(2)
+
     initial_seen.add(h_id)
 
 save_seen(initial_seen)
