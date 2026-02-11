@@ -4,6 +4,7 @@ Runs continuously, checking every 1 minute
 Handles restarts gracefully using persistent timestamp tracking
 """
 
+import sys
 import hashlib
 import time
 import json
@@ -12,10 +13,20 @@ from datetime import datetime, timedelta, timezone
 import requests
 from playwright.sync_api import sync_playwright
 import re
+from dotenv import load_dotenv
+
+# Fix Windows console encoding to support Unicode (₹, emojis, etc.)
+if sys.stdout.encoding != 'utf-8':
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+if sys.stderr.encoding != 'utf-8':
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+
+# Load environment variables from .env file
+load_dotenv()
 
 # CONFIGURATION
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8224764009:AAHG5AGUm5LD3KD9xwSyo2GRRTCl1wPuLBw")
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "678820723")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 NUVAMA_URL = "https://www.nuvamawealth.com/live-news"
 CHECK_INTERVAL_SECONDS = 60
 
@@ -127,10 +138,7 @@ def get_headlines():
     """Get headlines from Nuvama with timestamps and datetime objects"""
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(
-                executable_path="/nix/store/qa9cnw4v5xkxyip6mb9kxqfq1z4x2dx1-chromium-138.0.7204.100/bin/chromium",
-                headless=True
-            )
+            browser = p.chromium.launch(headless=True)
             page = browser.new_page()
 
             print("Loading page...")
@@ -422,12 +430,12 @@ print("=" * 60 + "\n")
 last_check = load_last_check_timestamp()
 if last_check:
     downtime = datetime.now(IST) - last_check
-    print(f"⚠️  RESTART DETECTED")
+    print("[!] RESTART DETECTED")
     print(f"Last check: {last_check.strftime('%d %b %Y %I:%M:%S %p IST')}")
     print(f"Downtime: {downtime}")
     print(f"Will send ONLY headlines newer than last check to Telegram\n")
 else:
-    print("🆕 FIRST RUN - Initializing baseline\n")
+    print("[*] FIRST RUN - Initializing baseline\n")
 
 # Send startup message
 send_telegram(
@@ -462,7 +470,7 @@ for h in initial_headlines:
     
     # Send alert only if truly new and newer than last check
     if is_new and should_alert:
-        print(f"📢 New during downtime: {headline_text[:60]}...")
+        print(f"[ALERT] New during downtime: {headline_text[:60]}...")
         send_telegram(headline_text)
         time.sleep(2)
     
@@ -482,7 +490,7 @@ while True:
         print(f"Waiting {CHECK_INTERVAL_SECONDS} seconds...\n")
         time.sleep(CHECK_INTERVAL_SECONDS)
     except KeyboardInterrupt:
-        print("\n⚠️  Stopped by user")
+        print("\n[!] Stopped by user")
         save_last_check_timestamp()
         break
     except Exception as e:
