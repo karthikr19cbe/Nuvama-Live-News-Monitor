@@ -350,6 +350,51 @@ def save_headline_to_db(headline_text, publish_timestamp):
         print(f"Database save error: {e}")
 
 
+def is_results_headline(headline_text, category=""):
+    """
+    Detect if a headline is a results/earnings headline.
+    Uses both category tag AND content-based detection for reliability.
+    The category tag from Nuvama is often not captured correctly,
+    so content-based detection is the primary method.
+    """
+    # Check category tag first (may be unreliable)
+    cat = category.strip().lower()
+    if cat in ("result", "results", "earning", "earnings"):
+        return True
+
+    # Content-based detection: look for earnings/results patterns in headline text
+    text_lower = headline_text.lower()
+
+    # Quarterly results pattern: "Q3 Net Profit", "Q2 Revenue", "Q1 EBITDA", etc.
+    if re.search(r'\bq[1-4]\b', text_lower):
+        # Confirm it's actually an earnings headline (not just mentioning Q1-Q4 casually)
+        earnings_keywords = [
+            'net profit', 'net loss', 'revenue', 'ebitda', 'ebitda margin',
+            'rupees vs', 'rupees vs.', 'yoy', 'qoq', 'est ',
+            'margin', 'topline', 'bottomline', 'bottom line', 'top line',
+            'profit after tax', 'pat ', 'sales ',
+        ]
+        if any(kw in text_lower for kw in earnings_keywords):
+            return True
+
+    # Direct financial results patterns (without Q1-Q4 prefix)
+    results_patterns = [
+        r'\bnet profit\b.*\brupees\b',
+        r'\bnet loss\b.*\brupees\b',
+        r'\brevenue\b.*\brupees\b.*\byoy\b',
+        r'\bebitda\b.*\brupees\b.*\byoy\b',
+        r'\bsl net profit\b',
+        r'\bcons net profit\b',
+        r'\bsl net loss\b',
+        r'\bcons net loss\b',
+    ]
+    for pattern in results_patterns:
+        if re.search(pattern, text_lower):
+            return True
+
+    return False
+
+
 def normalize_headline_for_dedup(headline_text):
     """
     Normalize headline for deduplication
@@ -416,8 +461,8 @@ def check_and_notify():
 
             # Only send to Telegram if it's truly new and not filtered
             if should_send_alert:
-                if EXCLUDE_RESULTS_ALERTS and category.lower() == "result":
-                    print(f"Filtered [{category}]: {headline_text[:70]}...")
+                if EXCLUDE_RESULTS_ALERTS and is_results_headline(headline_text, category):
+                    print(f"Filtered [Result]: {headline_text[:70]}...")
                 else:
                     print(f"Sending: {headline_text[:70]}...")
                     if send_telegram(headline_text):
@@ -485,7 +530,7 @@ for h in initial_headlines:
 
     # Send alert only if truly new and newer than last check
     if is_new and should_alert:
-        if EXCLUDE_RESULTS_ALERTS and category.lower() == "result":
+        if EXCLUDE_RESULTS_ALERTS and is_results_headline(headline_text, category):
             print(f"[FILTERED] Result skipped: {headline_text[:60]}...")
         else:
             print(f"[ALERT] New during downtime: {headline_text[:60]}...")
