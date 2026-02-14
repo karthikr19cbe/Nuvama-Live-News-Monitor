@@ -38,9 +38,9 @@ def run_web_server():
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("STARTING NUVAMA NEWS MONITOR SYSTEM")
+    print("STARTING UNIFIED NEWS MONITOR SYSTEM")
     print("=" * 60)
-    print("News Monitor: Running in background")
+    print("Unified Monitor (Nuvama + Stockwatch): Running in background")
     print("Web Dashboard: http://localhost:5000")
     print("=" * 60 + "\n")
 

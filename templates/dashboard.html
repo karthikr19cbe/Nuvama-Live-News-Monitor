@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Nuvama News Monitor - Live Dashboard</title>
+    <title>Unified News Monitor - Live Dashboard</title>
     <style>
         * {
             margin: 0;
@@ -58,7 +58,7 @@
             border-radius: 12px;
             box-shadow: 0 4px 15px rgba(0, 0, 0, 0.1);
             text-align: center;
-            min-width: 200px;
+            min-width: 150px;
         }
 
         .stat-card .number {
@@ -114,6 +114,10 @@
             transition: all 0.3s ease;
         }
 
+        .headline-item.source-stockwatch {
+            border-left-color: #f6ad55;
+        }
+
         .headline-item:hover {
             transform: translateX(5px);
             box-shadow: 0 4px 12px rgba(102, 126, 234, 0.2);
@@ -124,6 +128,36 @@
             font-size: 1.05rem;
             line-height: 1.6;
             margin-bottom: 10px;
+        }
+
+        .source-badge {
+            display: inline-block;
+            padding: 4px 10px;
+            border-radius: 4px;
+            font-size: 0.75rem;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-right: 10px;
+            vertical-align: middle;
+        }
+
+        .badge-nuvama {
+            background: #667eea;
+            color: white;
+        }
+
+        .badge-stockwatch {
+            background: #f6ad55;
+            color: #2d3748;
+        }
+
+        .company-tag {
+            display: inline-block;
+            font-size: 0.8rem;
+            font-weight: 600;
+            color: #4a5568;
+            margin-right: 6px;
         }
 
         .headline-meta {
@@ -176,7 +210,7 @@
             }
 
             .stat-card {
-                min-width: 150px;
+                min-width: 120px;
             }
 
             .headlines-container {
@@ -188,8 +222,8 @@
 <body>
     <div class="container">
         <div class="header">
-            <h1>📈 Nuvama News Monitor</h1>
-            <p class="subtitle">Real-time Financial News Tracking</p>
+            <h1>Unified News Monitor</h1>
+            <p class="subtitle">Real-time Financial News from Nuvama + Stockwatch</p>
         </div>
 
         <div class="stats">
@@ -204,6 +238,19 @@
                 </div>
                 <div class="label">Today's Updates</div>
             </div>
+            <div class="stat-card">
+                <div class="number">
+                    {% set sw_count = headlines|selectattr('source', 'defined')|selectattr('source', 'equalto', 'STOCKWATCH')|list|length %}
+                    {{ headlines|length - sw_count }}
+                </div>
+                <div class="label">Nuvama</div>
+            </div>
+            <div class="stat-card">
+                <div class="number">
+                    {{ sw_count }}
+                </div>
+                <div class="label">Stockwatch</div>
+            </div>
         </div>
 
         <div class="headlines-container">
@@ -214,15 +261,26 @@
 
             {% if headlines %}
                 {% for item in headlines %}
-                <div class="headline-item">
-                    <div class="headline-text">{{ item.headline }}</div>
+                {% set src = item.source|default('NUVAMA') %}
+                <div class="headline-item {% if src == 'STOCKWATCH' %}source-stockwatch{% endif %}">
+                    <div class="headline-text">
+                        {% if item.company %}
+                        <span class="company-tag">{{ item.company }} |</span>
+                        {% endif %}
+                        {{ item.headline }}
+                    </div>
                     <div class="headline-meta">
                         <span>
-                            🕐 {{ item.timestamp }}
+                            {{ item.timestamp }}
                         </span>
                         <span>
-                            📅 {{ item.date }}
+                            {{ item.date }}
                         </span>
+                        {% if src == 'STOCKWATCH' %}
+                        <span class="source-badge badge-stockwatch">STOCKWATCH</span>
+                        {% else %}
+                        <span class="source-badge badge-nuvama">NUVAMA</span>
+                        {% endif %}
                     </div>
                 </div>
                 {% endfor %}

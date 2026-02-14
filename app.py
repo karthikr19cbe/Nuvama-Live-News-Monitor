@@ -1,5 +1,5 @@
 """
-Flask Web Dashboard for Nuvama News Monitor
+Flask Web Dashboard for Unified News Monitor
 """
 
 from flask import Flask, render_template, jsonify
