@@ -179,3 +179,8 @@ error_log.json
 
 # Windows artifacts
 nul
+# Runtime state — regenerated on each run; tracking these causes a merge
+# conflict every time you switch machines.
+headlines_database.json
+headlines_seen.json
+last_check_timestamp.json
