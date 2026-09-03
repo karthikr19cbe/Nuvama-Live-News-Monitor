@@ -11,6 +11,7 @@ import time
 import json
 import os
 import csv
+import threading
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from urllib.parse import unquote, parse_qs, urlparse
@@ -32,7 +33,14 @@ load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 NUVAMA_URL = "https://www.nuvamawealth.com/live-news"
-STOCKWATCH_URL = "https://www.stockwatch.live/dashboard"
+STOCKWATCH_URL = "https://stockwatch.live/in/live"  # human-facing "Live" feed (for reference)
+# Public JSON API behind the Live feed — fetched directly (no browser). Returns
+# ALL corporate-action categories (Board Meeting, Dividend, Merger, ESG, ...).
+STOCKWATCH_API_URL = "https://api.stockwatch.live/api/keyEvents/"
+# How far back to fetch each cycle. Newest-first; exact-dedup handles overlap.
+STOCKWATCH_LOOKBACK_DAYS = int(os.getenv("STOCKWATCH_LOOKBACK_DAYS", "2"))
+# Cap on events pulled per cycle (paginated 50 at a time).
+STOCKWATCH_MAX_ITEMS = int(os.getenv("STOCKWATCH_MAX_ITEMS", "100"))
 CHECK_INTERVAL_SECONDS = 60
 
 # RESULTS FILTER - skip earnings/results headlines from Telegram (still saved to dashboard)
@@ -87,6 +95,51 @@ def log_error(error_type, message, details=None):
         print(f"Error logging failed: {e}")
 
 
+# ---------- WATCHDOG ----------
+# A hung Playwright/Chromium scrape can block the whole process indefinitely
+# (its own 45s timeout doesn't always fire when the browser zombies), which
+# silently freezes the monitor with no error logged. The watchdog force-exits
+# the process if no progress heartbeat is seen for WATCHDOG_TIMEOUT seconds.
+# run_all.py then respawns main.py automatically, so a hang self-heals.
+WATCHDOG_TIMEOUT = int(os.getenv("WATCHDOG_TIMEOUT", "300"))  # seconds
+_last_heartbeat = None
+_heartbeat_lock = threading.Lock()
+
+
+def heartbeat():
+    """Mark that the monitor is making progress (called at safe points)."""
+    global _last_heartbeat
+    with _heartbeat_lock:
+        _last_heartbeat = time.time()
+
+
+def _watchdog_loop():
+    while True:
+        time.sleep(30)
+        with _heartbeat_lock:
+            last = _last_heartbeat
+        if last is None:
+            continue
+        elapsed = time.time() - last
+        if elapsed > WATCHDOG_TIMEOUT:
+            msg = f"No progress for {int(elapsed)}s (likely hung scrape) — forcing restart"
+            print(f"[WATCHDOG] {msg}")
+            try:
+                log_error("watchdog", msg, None)
+            except Exception:
+                pass
+            # Hard-exit so run_all.py's supervisor respawns a fresh main.py
+            os._exit(1)
+
+
+def start_watchdog():
+    """Start the background watchdog thread."""
+    heartbeat()
+    t = threading.Thread(target=_watchdog_loop, daemon=True)
+    t.start()
+    print(f"Watchdog started (force-restart if no progress for {WATCHDOG_TIMEOUT}s)")
+
+
 def parse_timestamp_to_datetime(publish_timestamp):
     """
     Convert timestamp to IST datetime object for comparison.
@@ -101,29 +154,39 @@ def parse_timestamp_to_datetime(publish_timestamp):
         if re.match(r'^Just\s+Now$', timestamp_str, re.IGNORECASE):
             return datetime.now(IST)
         
-        # Handle relative timestamps like "15 mins ago" or "2 hours ago"
-        relative_match = re.match(r'^(\d+)\s+(min|mins|hour|hours)\s+ago$', timestamp_str)
+        # Handle relative timestamps like "15 mins ago", "2 hours ago", "12h ago", "5m ago"
+        relative_match = re.match(r'^(\d+)\s*(min|mins|minute|minutes|m|hour|hours|h|d|day|days)\s*ago$', timestamp_str, re.IGNORECASE)
         if relative_match:
             amount = int(relative_match.group(1))
-            unit = relative_match.group(2)
-            
+            unit = relative_match.group(2).lower()
+
             now_ist = datetime.now(IST)
-            if unit in ['min', 'mins']:
+            if unit in ['min', 'mins', 'minute', 'minutes', 'm']:
                 return now_ist - timedelta(minutes=amount)
-            else:  # hours
+            elif unit in ['hour', 'hours', 'h']:
                 return now_ist - timedelta(hours=amount)
+            elif unit in ['d', 'day', 'days']:
+                return now_ist - timedelta(days=amount)
         
         # Handle absolute timestamps like "03 Nov 08:26 AM"
         try:
             parsed_time = datetime.strptime(timestamp_str, '%d %b %I:%M %p')
             current_year = datetime.now(IST).year
-            # Create timezone-aware datetime in IST
             parsed_time = parsed_time.replace(year=current_year, tzinfo=IST)
             return parsed_time
         except:
             pass
 
-        # Handle Stockwatch format: "4m ago | 07:42 PM 12-02-2026"
+        # Handle Stockwatch short date format: "4 Apr", "12 Mar"
+        try:
+            parsed_time = datetime.strptime(timestamp_str, '%d %b')
+            current_year = datetime.now(IST).year
+            parsed_time = parsed_time.replace(year=current_year, tzinfo=IST)
+            return parsed_time
+        except:
+            pass
+
+        # Handle Stockwatch format: "4m ago | 07:42 PM 12-02-2026" (legacy)
         stockwatch_match = re.match(
             r'(\d+)m\s+ago\s*\|\s*(\d{1,2}:\d{2}\s*[AP]M)\s+(\d{2}-\d{2}-\d{4})',
             timestamp_str
@@ -143,8 +206,8 @@ def parse_timestamp_to_datetime(publish_timestamp):
         return None
 
 
-def send_telegram(headline_text, source="", company=""):
-    """Send one headline to Telegram with source tag and company info"""
+def send_telegram(headline_text, source="", company="", description=""):
+    """Send one headline to Telegram with source tag, company info, and optional description"""
     try:
         headline_clean = headline_text.strip()
 
@@ -152,6 +215,12 @@ def send_telegram(headline_text, source="", company=""):
         if company:
             parts.append(f"<i>{company}</i>")
         parts.append(headline_clean)
+        if description:
+            # Trim description to ~200 words max
+            words = description.split()
+            if len(words) > 200:
+                description = ' '.join(words[:200]) + '...'
+            parts.append(f"\n{description}")
         if source:
             parts.append(f"<b>[{source}]</b>")
 
@@ -182,14 +251,36 @@ def scrape_nuvama():
     """Scrape headlines from Nuvama with timestamps and datetime objects"""
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
+            # Nuvama's SPA detects headless Chromium and never loads the news
+            # feed (only the page shell renders). A headed browser loads it
+            # instantly. Launch headed but positioned far off-screen so no
+            # visible window disrupts the desktop.
+            browser = p.chromium.launch(
+                headless=False,
+                args=[
+                    "--window-position=-32000,-32000",
+                    "--window-size=1366,900",
+                    "--disable-blink-features=AutomationControlled",
+                ],
+            )
             page = browser.new_page()
 
             print("Loading page...")
             page.goto(NUVAMA_URL, wait_until="domcontentloaded", timeout=45000)
-            time.sleep(8)
 
-            all_text = page.inner_text("body")
+            # Wait for the live feed to actually render (timestamps appear)
+            # rather than a fixed blind sleep. Poll up to ~24s.
+            feed_pat = r'(Just\s+Now|\d+\s+(?:min|mins|hour|hours)\s+ago|\d{2}\s+[A-Za-z]{3}\s+\d{2}:\d{2}\s+[AP]M)'
+            all_text = ""
+            for _ in range(12):
+                time.sleep(2)
+                all_text = page.inner_text("body")
+                if "403 ERROR" in all_text or "Request blocked" in all_text:
+                    log_error("scraping", "Nuvama returned 403 (blocked/rate-limited)", NUVAMA_URL)
+                    browser.close()
+                    return []
+                if len(re.findall(feed_pat, all_text, re.IGNORECASE)) >= 3:
+                    break
             browser.close()
 
             lines = all_text.split('\n')
@@ -297,61 +388,96 @@ def scrape_nuvama():
         return []
 
 
+def _parse_iso_utc_to_ist(iso_str):
+    """Parse an ISO-8601 UTC timestamp (e.g. '2026-07-21T17:50:19.000Z') to IST."""
+    if not iso_str:
+        return None
+    for fmt in ("%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ"):
+        try:
+            dt = datetime.strptime(iso_str, fmt)
+            return dt.replace(tzinfo=timezone.utc).astimezone(IST)
+        except ValueError:
+            continue
+    return None
+
+
 def scrape_stockwatch():
-    """Scrape headlines from Stockwatch.live dashboard"""
+    """Fetch corporate-action headlines from the Stockwatch public JSON API.
+
+    Uses the same endpoint the stockwatch.live/in/live feed calls
+    (api.stockwatch.live/api/keyEvents). This replaces the old browser scrape of
+    /dashboard, which the 2026 redesign reduced to text-less compact rows (so
+    dividends/splits/bonuses were silently dropped and the browser routinely hung).
+
+    Each event carries: a clean title, full summary, category (Board Meeting,
+    Dividend, Merger, ESG, Quarterly Result, ...), a real publish timestamp, a
+    unique uuid, and the company's ticker + full name. Newest-first, paginated.
+    """
     try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            page = browser.new_page()
+        now_utc = datetime.now(timezone.utc)
+        start = (now_utc - timedelta(days=STOCKWATCH_LOOKBACK_DAYS)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        end = (now_utc + timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
-            print("Loading Stockwatch...")
-            page.goto(STOCKWATCH_URL, wait_until="domcontentloaded", timeout=45000)
-            time.sleep(8)
+        headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
+        headlines = []
+        seen_uuids = set()
+        offset = 0
+        PAGE = 50
 
-            headlines = []
+        while offset < STOCKWATCH_MAX_ITEMS:
+            params = {
+                "offset": offset,
+                "limit": PAGE,
+                "startDate": start,
+                "endDate": end,
+            }
+            resp = requests.get(STOCKWATCH_API_URL, params=params, headers=headers, timeout=30)
+            resp.raise_for_status()
+            items = resp.json().get("data") or []
+            if not items:
+                break
 
-            # Stockwatch renders headlines as <a> tags with URL params containing newsId
-            links = page.query_selector_all('a[href*="newsId"]')
+            for it in items:
+                uuid = (it.get("uuid") or "").strip()
+                if uuid and uuid in seen_uuids:
+                    continue
+                seen_uuids.add(uuid)
 
-            for link in links:
-                try:
-                    href = link.get_attribute('href') or ''
-
-                    # Parse URL parameters
-                    parsed = urlparse(href)
-                    params = parse_qs(parsed.query)
-
-                    company = unquote(params.get('name', [''])[0]).strip()
-                    title = unquote(params.get('title', [''])[0]).strip()
-                    news_id = params.get('newsId', [''])[0].strip()
-
-                    if not title or len(title) < 15:
-                        continue
-
-                    # Extract timestamp from <h6> element inside the link
-                    h6 = link.query_selector('h6')
-                    timestamp_str = h6.inner_text().strip() if h6 else ''
-
-                    datetime_obj = parse_timestamp_to_datetime(timestamp_str) if timestamp_str else None
-
-                    headlines.append({
-                        'headline': title,
-                        'timestamp': timestamp_str,
-                        'datetime': datetime_obj,
-                        'category': '',
-                        'source': 'STOCKWATCH',
-                        'company': company,
-                        'news_id': news_id
-                    })
-                except Exception:
+                title = (it.get("title") or "").strip()
+                if not title:
                     continue
 
-            browser.close()
-            print(f"Found {len(headlines)} Stockwatch headlines")
-            return headlines
+                summary = (it.get("summary") or "").strip()
+                category = (it.get("category") or "").strip()
+
+                stock = it.get("stock") or it.get("bseStock") or {}
+                code = (stock.get("code") or "").strip()
+                name = (stock.get("name") or "").strip()
+
+                # Real publish time (UTC -> IST); fall back to now if missing
+                dt = _parse_iso_utc_to_ist(it.get("createdAt")) or datetime.now(IST)
+
+                headlines.append({
+                    'headline': title,
+                    'description': summary,
+                    'timestamp': dt.strftime('%d %b %I:%M %p'),
+                    'datetime': dt,
+                    'category': category,
+                    'source': 'STOCKWATCH',
+                    'company': code,
+                    'company_name': name,
+                    'news_id': uuid,
+                })
+
+            if len(items) < PAGE:
+                break
+            offset += PAGE
+
+        print(f"Found {len(headlines)} Stockwatch headlines")
+        return headlines
 
     except Exception as e:
-        log_error("scraping_stockwatch", str(e), STOCKWATCH_URL)
+        log_error("scraping_stockwatch", str(e), STOCKWATCH_API_URL)
         print(f"Stockwatch scraping error: {e}")
         return []
 
@@ -505,27 +631,30 @@ def load_nifty500_companies():
     return companies, aliases
 
 
-def is_nifty500_match(company_name, headline_text=""):
-    """Check if a Stockwatch company matches a Nifty 500 company.
+def is_nifty500_match(company_name, headline_text="", alt_name=""):
+    """Check if a Stockwatch company matches a Nifty 500 / additional company.
     Uses EXACT matching only — no substring matching.
-    The company_name from Stockwatch URL params is a reliable identifier.
+    Checks both identifiers the API gives us: the ticker code (matches the CSV
+    Symbol column) and the full company name (matches the CSV Company Name).
     """
     companies, aliases = load_nifty500_companies()
 
     if not companies:
         return True  # Fail-open: if CSV not loaded, allow all through
 
-    if company_name:
-        # Normalize the Stockwatch company name the same way as Nifty 500 names
-        normalized = _normalize_company(company_name)
+    # Try the ticker code first, then the full company name as a fallback.
+    for candidate in (company_name, alt_name):
+        if not candidate:
+            continue
+        # Normalize the candidate the same way as Nifty 500 names
+        normalized = _normalize_company(candidate)
 
         # Exact match of normalized name (e.g., "hdfc bank" == "hdfc bank")
         if normalized in companies:
             return True
 
         # Exact match of concatenated form (e.g., "hdfcbank" == "hdfcbank")
-        no_spaces = normalized.replace(' ', '')
-        if no_spaces in companies:
+        if normalized.replace(' ', '') in companies:
             return True
 
     # No substring matching, no headline text matching — exact only
@@ -603,8 +732,8 @@ def save_headline_to_db(headline_text, publish_timestamp, source="", company="")
             formatted_timestamp = datetime_obj.strftime('%d %b %I:%M %p')
             formatted_date = datetime_obj.strftime('%Y-%m-%d')
         else:
-            # Fallback: if timestamp text is too long, it's not a real timestamp
-            if len(publish_timestamp) > 50:
+            # Fallback: use current time if timestamp is empty or unparseable
+            if not publish_timestamp or len(publish_timestamp) > 50:
                 formatted_timestamp = datetime.now(IST).strftime('%d %b %I:%M %p')
             else:
                 formatted_timestamp = publish_timestamp
@@ -1111,6 +1240,7 @@ def check_and_notify():
     print("=" * 60)
     print(f"Checking... {datetime.now(IST).strftime('%Y-%m-%d %I:%M:%S %p IST')}")
 
+    heartbeat()
     seen_ids = load_seen()
     context_memory = load_context_memory()
     headlines = get_all_headlines()
@@ -1128,12 +1258,14 @@ def check_and_notify():
     nifty500_companies, _ = load_nifty500_companies()
 
     for h in headlines:
+        heartbeat()
         headline_text = h['headline']
         timestamp = h['timestamp']
         datetime_obj = h['datetime']
         category = h.get('category', '')
         source = h.get('source', 'NUVAMA')
         company = h.get('company', '')
+        description = h.get('description', '')
 
         # --- LAYER A: Exact dedup ---
         headline_normalized = normalize_headline_for_exact_dedup(headline_text)
@@ -1145,7 +1277,7 @@ def check_and_notify():
 
         # --- Nifty 500 filter (Stockwatch only) ---
         if source == 'STOCKWATCH' and nifty500_companies:
-            if not is_nifty500_match(company, headline_text):
+            if not is_nifty500_match(company, headline_text, h.get('company_name', '')):
                 print(f"Filtered [Not Nifty500]: {headline_text[:60]}...")
                 continue
 
@@ -1176,7 +1308,7 @@ def check_and_notify():
 
         # --- SEND TO TELEGRAM ---
         print(f"Sending [{source}]: {headline_text[:70]}...")
-        if send_telegram(headline_text, source, company):
+        if send_telegram(headline_text, source, company, description):
             embedding = get_embedding(headline_text) if ENABLE_EMBEDDING_DEDUP else None
             context_memory = add_to_context_memory(context_memory, headline_text, source, company, embedding)
             time.sleep(2)
@@ -1223,6 +1355,9 @@ send_telegram(
     "🔄 Unified Monitor restarted! Tracking Nuvama + Stockwatch. Only new headlines will be sent."
 )
 
+# Start the watchdog so even a hung baseline scrape self-recovers
+start_watchdog()
+
 # Initial baseline with timestamp-based filtering
 print("Setting baseline...")
 initial_headlines = get_all_headlines()
@@ -1231,16 +1366,18 @@ initial_context_memory = load_context_memory()
 nifty500_companies, _ = load_nifty500_companies()
 
 for h in initial_headlines:
+    heartbeat()
     headline_text = h['headline']
     timestamp = h['timestamp']
     datetime_obj = h['datetime']
     category = h.get('category', '')
     source = h.get('source', 'NUVAMA')
     company = h.get('company', '')
+    description = h.get('description', '')
 
     # Nifty 500 filter (Stockwatch only) — apply to ALL headlines, not just new
     if source == 'STOCKWATCH' and nifty500_companies:
-        if not is_nifty500_match(company, headline_text):
+        if not is_nifty500_match(company, headline_text, h.get('company_name', '')):
             headline_normalized = normalize_headline_for_exact_dedup(headline_text)
             h_id = hashlib.md5(headline_normalized.encode()).hexdigest()
             initial_seen.add(h_id)
@@ -1272,7 +1409,7 @@ for h in initial_headlines:
                 print(f"[Cross-Source Dup {score:.2f}] [{source}]: {headline_text[:60]}...")
             else:
                 print(f"[ALERT] New during downtime [{source}]: {headline_text[:60]}...")
-                if send_telegram(headline_text, source, company):
+                if send_telegram(headline_text, source, company, description):
                     embedding = get_embedding(headline_text) if ENABLE_EMBEDDING_DEDUP else None
                     initial_context_memory = add_to_context_memory(
                         initial_context_memory, headline_text, source, company, embedding
@@ -1290,9 +1427,11 @@ print(f"Baseline set: {len(initial_headlines)} current headlines\n")
 check_count = 0
 while True:
     try:
+        heartbeat()
         check_count += 1
         print(f"\n--- Check #{check_count} ---")
         check_and_notify()
+        heartbeat()
         print(f"Waiting {CHECK_INTERVAL_SECONDS} seconds...\n")
         time.sleep(CHECK_INTERVAL_SECONDS)
     except KeyboardInterrupt:
