@@ -45,6 +45,8 @@ CHECK_INTERVAL_SECONDS = 60
 
 # RESULTS FILTER - skip earnings/results headlines from Telegram (still saved to dashboard)
 EXCLUDE_RESULTS_ALERTS = os.getenv("EXCLUDE_RESULTS_ALERTS", "false").lower() == "true"
+# Skip advance board-meeting notices ("Board Meeting on <date>", "Board to Consider ...")
+EXCLUDE_BOARD_MEETING_NOTICES = os.getenv("EXCLUDE_BOARD_MEETING_NOTICES", "true").lower() == "true"
 
 # STOCKWATCH FEED TOGGLE
 ENABLE_STOCKWATCH = os.getenv("ENABLE_STOCKWATCH", "true").lower() == "true"
@@ -57,6 +59,9 @@ ADDITIONAL_CSV_PATH = os.getenv("ADDITIONAL_CSV_PATH", "")
 ENABLE_EMBEDDING_DEDUP = os.getenv("ENABLE_EMBEDDING_DEDUP", "false").lower() == "true"
 EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "sentence-transformers/all-MiniLM-L6-v2")
 CONTEXTUAL_DEDUP_THRESHOLD = float(os.getenv("CONTEXTUAL_DEDUP_THRESHOLD", "0.68"))
+# Same-company items where this share of one headline's key words appear in the
+# other's headline + Stockwatch description are treated as duplicates
+DESCRIPTION_DEDUP_THRESHOLD = float(os.getenv("DESCRIPTION_DEDUP_THRESHOLD", "0.7"))
 
 # STATE FILES
 HISTORY_FILE = "headlines_seen.json"
@@ -247,140 +252,187 @@ def send_telegram(headline_text, source="", company="", description=""):
         return False
 
 
+# Persistent Nuvama browser: launched once and reused across checks (the page
+# is just reloaded each cycle) so a Chrome window doesn't pop in and out of the
+# taskbar every minute. Any failure tears it down and the next check relaunches.
+_nv_playwright = None
+_nv_browser = None
+_nv_page = None
+
+
+def _close_nuvama_browser():
+    global _nv_playwright, _nv_browser, _nv_page
+    for obj in (_nv_browser, _nv_playwright):
+        try:
+            if obj is _nv_playwright and obj is not None:
+                obj.stop()
+            elif obj is not None:
+                obj.close()
+        except Exception:
+            pass
+    _nv_playwright = _nv_browser = _nv_page = None
+
+
+def _get_nuvama_page():
+    global _nv_playwright, _nv_browser, _nv_page
+    if _nv_page is not None and not _nv_page.is_closed() and _nv_browser.is_connected():
+        return _nv_page
+    _close_nuvama_browser()
+    _nv_playwright = sync_playwright().start()
+    # Nuvama's SPA detects headless Chromium and never loads the news
+    # feed (only the page shell renders). A headed browser loads it
+    # instantly. Launch headed but positioned far off-screen so no
+    # visible window disrupts the desktop.
+    _nv_browser = _nv_playwright.chromium.launch(
+        headless=False,
+        args=[
+            "--window-position=-32000,-32000",
+            "--window-size=1366,900",
+            "--disable-blink-features=AutomationControlled",
+        ],
+    )
+    _nv_page = _nv_browser.new_page()
+    return _nv_page
+
+
+def _fetch_nuvama_text():
+    """Load (or reload) the Nuvama live feed and return the page body text.
+
+    Returns None if Nuvama blocked the request. Raises on browser errors after
+    tearing the browser down so the next call starts fresh.
+    """
+    try:
+        page = _get_nuvama_page()
+
+        print("Loading page...")
+        page.goto(NUVAMA_URL, wait_until="domcontentloaded", timeout=45000)
+
+        # Wait for the live feed to actually render (timestamps appear)
+        # rather than a fixed blind sleep. Poll up to ~24s.
+        feed_pat = r'(Just\s+Now|\d+\s+(?:min|mins|hour|hours)\s+ago|\d{2}\s+[A-Za-z]{3}\s+\d{2}:\d{2}\s+[AP]M)'
+        all_text = ""
+        for _ in range(12):
+            time.sleep(2)
+            all_text = page.inner_text("body")
+            if "403 ERROR" in all_text or "Request blocked" in all_text:
+                log_error("scraping", "Nuvama returned 403 (blocked/rate-limited)", NUVAMA_URL)
+                # Drop the session so the next attempt starts with a clean browser
+                _close_nuvama_browser()
+                return None
+            if len(re.findall(feed_pat, all_text, re.IGNORECASE)) >= 3:
+                break
+        return all_text
+    except Exception:
+        _close_nuvama_browser()
+        raise
+
+
 def scrape_nuvama():
     """Scrape headlines from Nuvama with timestamps and datetime objects"""
     try:
-        with sync_playwright() as p:
-            # Nuvama's SPA detects headless Chromium and never loads the news
-            # feed (only the page shell renders). A headed browser loads it
-            # instantly. Launch headed but positioned far off-screen so no
-            # visible window disrupts the desktop.
-            browser = p.chromium.launch(
-                headless=False,
-                args=[
-                    "--window-position=-32000,-32000",
-                    "--window-size=1366,900",
-                    "--disable-blink-features=AutomationControlled",
-                ],
-            )
-            page = browser.new_page()
+        all_text = _fetch_nuvama_text()
+        if all_text is None:
+            return []
 
-            print("Loading page...")
-            page.goto(NUVAMA_URL, wait_until="domcontentloaded", timeout=45000)
 
-            # Wait for the live feed to actually render (timestamps appear)
-            # rather than a fixed blind sleep. Poll up to ~24s.
-            feed_pat = r'(Just\s+Now|\d+\s+(?:min|mins|hour|hours)\s+ago|\d{2}\s+[A-Za-z]{3}\s+\d{2}:\d{2}\s+[AP]M)'
-            all_text = ""
-            for _ in range(12):
-                time.sleep(2)
-                all_text = page.inner_text("body")
-                if "403 ERROR" in all_text or "Request blocked" in all_text:
-                    log_error("scraping", "Nuvama returned 403 (blocked/rate-limited)", NUVAMA_URL)
-                    browser.close()
-                    return []
-                if len(re.findall(feed_pat, all_text, re.IGNORECASE)) >= 3:
-                    break
-            browser.close()
+        lines = all_text.split('\n')
+        headlines = []
+        
+        # Pattern to match absolute timestamps like "03 Nov 06:35 AM"
+        absolute_timestamp_pattern = r'^\d{2}\s+[A-Za-z]{3}\s+\d{2}:\d{2}\s+[AP]M$'
+        # Pattern to match relative timestamps like "15 mins ago", "1 hour ago"
+        relative_timestamp_pattern = r'^\d+\s+(min|mins|hour|hours)\s+ago$'
+        # Pattern to match "Just Now"
+        just_now_pattern = r'^Just\s+Now$'
 
-            lines = all_text.split('\n')
-            headlines = []
+        # Navigation/menu items to skip (exact matches only)
+        skip_exact = [
+            'live news', 'all', 'results', 'block deals', 'equity', 
+            'commentary', 'global', 'fixed income', 'commodities', 
+            'solutions', 'markets', 'tools & resources',
+            'support', 'login / sign up', 'search', '0 updates'
+        ]
+        
+        # Generic words that should be filtered
+        skip_patterns = [
+            'sign up', 'get started', 'why nuvama', 'support center', 
+            'helpdesk', 'feedback', 'visit', 'locate', 'healthy financial',
+            'customer', 'trader', 'menu', 'investor charter', 
+            'dispute resolution portal', 'issue with our website',
+            'issue is not resolved', 'join ', 'million customers',
+            'empowering our clients', 'mon-fri', 'all rights reserved',
+            'sebi scores', 'broking services offered by', 'registered office',
+            'corporate office', 'financial products distribution',
+            'most important terms', 'prevent unauthorized', 'healthy financial journey',
+            'switch to old website', 'clicking the button below'
+        ]
+        
+        # Legal patterns
+        legal_patterns = ['broking services offered by', 'registered office', 
+                         'corporate office', 'all rights reserved', 'sebi scores',
+                         'prevent unauthorized', 'financial products distribution',
+                         'most important terms', 'investor charter',
+                         'dispute resolution', 'issue is not resolved',
+                         'empowering our clients', 'dedicated to empowering']
+
+        i = 0
+        while i < len(lines):
+            line_clean = lines[i].strip()
             
-            # Pattern to match absolute timestamps like "03 Nov 06:35 AM"
-            absolute_timestamp_pattern = r'^\d{2}\s+[A-Za-z]{3}\s+\d{2}:\d{2}\s+[AP]M$'
-            # Pattern to match relative timestamps like "15 mins ago", "1 hour ago"
-            relative_timestamp_pattern = r'^\d+\s+(min|mins|hour|hours)\s+ago$'
-            # Pattern to match "Just Now"
-            just_now_pattern = r'^Just\s+Now$'
-
-            # Navigation/menu items to skip (exact matches only)
-            skip_exact = [
-                'live news', 'all', 'results', 'block deals', 'equity', 
-                'commentary', 'global', 'fixed income', 'commodities', 
-                'solutions', 'markets', 'tools & resources',
-                'support', 'login / sign up', 'search', '0 updates'
-            ]
-            
-            # Generic words that should be filtered
-            skip_patterns = [
-                'sign up', 'get started', 'why nuvama', 'support center', 
-                'helpdesk', 'feedback', 'visit', 'locate', 'healthy financial',
-                'customer', 'trader', 'menu', 'investor charter', 
-                'dispute resolution portal', 'issue with our website',
-                'issue is not resolved', 'join ', 'million customers',
-                'empowering our clients', 'mon-fri', 'all rights reserved',
-                'sebi scores', 'broking services offered by', 'registered office',
-                'corporate office', 'financial products distribution',
-                'most important terms', 'prevent unauthorized', 'healthy financial journey',
-                'switch to old website', 'clicking the button below'
-            ]
-            
-            # Legal patterns
-            legal_patterns = ['broking services offered by', 'registered office', 
-                             'corporate office', 'all rights reserved', 'sebi scores',
-                             'prevent unauthorized', 'financial products distribution',
-                             'most important terms', 'investor charter',
-                             'dispute resolution', 'issue is not resolved',
-                             'empowering our clients', 'dedicated to empowering']
-
-            i = 0
-            while i < len(lines):
-                line_clean = lines[i].strip()
+            # Look for a headline followed by a timestamp
+            if i + 1 < len(lines):
+                next_line = lines[i + 1].strip()
                 
-                # Look for a headline followed by a timestamp
-                if i + 1 < len(lines):
-                    next_line = lines[i + 1].strip()
+                # Check if next line is a timestamp (absolute, relative, or "Just Now")
+                is_absolute_timestamp = re.match(absolute_timestamp_pattern, next_line)
+                is_relative_timestamp = re.match(relative_timestamp_pattern, next_line)
+                is_just_now = re.match(just_now_pattern, next_line, re.IGNORECASE)
+                
+                if is_absolute_timestamp or is_relative_timestamp or is_just_now:
+                    # This line might be a headline
                     
-                    # Check if next line is a timestamp (absolute, relative, or "Just Now")
-                    is_absolute_timestamp = re.match(absolute_timestamp_pattern, next_line)
-                    is_relative_timestamp = re.match(relative_timestamp_pattern, next_line)
-                    is_just_now = re.match(just_now_pattern, next_line, re.IGNORECASE)
-                    
-                    if is_absolute_timestamp or is_relative_timestamp or is_just_now:
-                        # This line might be a headline
-                        
-                        # Length filter
-                        if len(line_clean) >= 30 and len(line_clean) <= 1500:
-                            # Skip navigation items
-                            if line_clean.lower() in skip_exact:
-                                i += 1
-                                continue
-                            
-                            # Skip generic patterns
-                            if any(skip_word in line_clean.lower() for skip_word in skip_patterns):
-                                i += 1
-                                continue
-                            
-                            # Skip legal patterns
-                            if any(legal in line_clean.lower() for legal in legal_patterns):
-                                i += 1
-                                continue
-                            
-                            # This looks like a real headline
-                            timestamp_str = next_line
-                            datetime_obj = parse_timestamp_to_datetime(timestamp_str)
-
-                            # Check line after timestamp for category tag (Result, Equity, etc.)
-                            category = ""
-                            if i + 2 < len(lines):
-                                category = lines[i + 2].strip()
-
-                            headlines.append({
-                                'headline': line_clean,
-                                'timestamp': timestamp_str,
-                                'datetime': datetime_obj,  # For comparison
-                                'category': category
-                            })
-                            i += 3  # Skip headline, timestamp, and category
+                    # Length filter
+                    if len(line_clean) >= 30 and len(line_clean) <= 1500:
+                        # Skip navigation items
+                        if line_clean.lower() in skip_exact:
+                            i += 1
                             continue
-                
-                i += 1
+                        
+                        # Skip generic patterns
+                        if any(skip_word in line_clean.lower() for skip_word in skip_patterns):
+                            i += 1
+                            continue
+                        
+                        # Skip legal patterns
+                        if any(legal in line_clean.lower() for legal in legal_patterns):
+                            i += 1
+                            continue
+                        
+                        # This looks like a real headline
+                        timestamp_str = next_line
+                        datetime_obj = parse_timestamp_to_datetime(timestamp_str)
+
+                        # Check line after timestamp for category tag (Result, Equity, etc.)
+                        category = ""
+                        if i + 2 < len(lines):
+                            category = lines[i + 2].strip()
+
+                        headlines.append({
+                            'headline': line_clean,
+                            'timestamp': timestamp_str,
+                            'datetime': datetime_obj,  # For comparison
+                            'category': category
+                        })
+                        i += 3  # Skip headline, timestamp, and category
+                        continue
             
-            # Don't reverse - Nuvama already shows newest headlines first
-            # Headlines will be processed in order: newest first
-            
-            print(f"Found {len(headlines)} headlines")
-            return headlines
+            i += 1
+        
+        # Don't reverse - Nuvama already shows newest headlines first
+        # Headlines will be processed in order: newest first
+        
+        print(f"Found {len(headlines)} headlines")
+        return headlines
 
     except Exception as e:
         log_error("scraping", str(e), NUVAMA_URL)
@@ -545,16 +597,21 @@ def _normalize_company(name):
 def _load_companies_from_csv(csv_path, companies, aliases):
     """Load companies from a single CSV into the provided set and dict.
     Supports NSE format (Company Name, Symbol) and simple format.
-    Returns count of new identifiers added.
+    Returns (companies_in_file, new_search_terms_added).
     """
     count_before = len(companies)
-    with open(csv_path, 'r', encoding='utf-8') as f:
+    rows = 0
+    with open(csv_path, 'r', encoding='utf-8-sig') as f:
         reader = csv.DictReader(f)
         for row in reader:
-            symbol = row.get('Symbol', '').strip().upper()
-            name = row.get('Company Name', '').strip()
+            # Header names are matched case-insensitively ("COMPANY NAME" == "Company Name")
+            row = {(k or '').strip().lower(): (v or '') for k, v in row.items()}
+            symbol = row.get('symbol', '').strip().upper()
+            name = row.get('company name', '').strip()
 
             canonical = name or symbol
+            if canonical:
+                rows += 1
 
             # Add symbol lowercase (e.g., "hdfcbank", "tcs", "reliance")
             if symbol and len(symbol) >= 2:
@@ -575,7 +632,7 @@ def _load_companies_from_csv(csv_path, companies, aliases):
                     aliases[no_spaces] = canonical
 
             # If CSV has an Aliases column (optional), parse it too
-            alias_str = row.get('Aliases', '')
+            alias_str = row.get('aliases', '')
             if alias_str:
                 for alias in alias_str.split(','):
                     alias_clean = alias.strip().lower()
@@ -583,7 +640,7 @@ def _load_companies_from_csv(csv_path, companies, aliases):
                         companies.add(alias_clean)
                         aliases[alias_clean] = canonical
 
-    return len(companies) - count_before
+    return rows, len(companies) - count_before
 
 
 def load_nifty500_companies():
@@ -605,8 +662,8 @@ def load_nifty500_companies():
 
     # Load primary list (Nifty 500)
     try:
-        count = _load_companies_from_csv(NIFTY500_CSV_PATH, companies, aliases)
-        print(f"Loaded {count} identifiers from {NIFTY500_CSV_PATH}")
+        rows, terms = _load_companies_from_csv(NIFTY500_CSV_PATH, companies, aliases)
+        print(f"Loaded {rows} companies ({terms} search terms) from {NIFTY500_CSV_PATH}")
     except FileNotFoundError:
         print(f"Warning: {NIFTY500_CSV_PATH} not found. Stockwatch filter disabled.")
     except Exception as e:
@@ -616,15 +673,15 @@ def load_nifty500_companies():
     # Load additional company list (if configured)
     if ADDITIONAL_CSV_PATH:
         try:
-            count = _load_companies_from_csv(ADDITIONAL_CSV_PATH, companies, aliases)
-            print(f"Loaded {count} additional identifiers from {ADDITIONAL_CSV_PATH}")
+            rows, terms = _load_companies_from_csv(ADDITIONAL_CSV_PATH, companies, aliases)
+            print(f"Loaded {rows} additional companies ({terms} new search terms) from {ADDITIONAL_CSV_PATH}")
         except FileNotFoundError:
             print(f"Warning: {ADDITIONAL_CSV_PATH} not found. Skipping additional list.")
         except Exception as e:
             log_error("additional_csv_load", str(e), ADDITIONAL_CSV_PATH)
             print(f"Error loading additional CSV: {e}")
 
-    print(f"Total company filter: {len(companies)} identifiers")
+    print(f"Total company filter: {len(companies)} search terms")
 
     _nifty500_companies = companies
     _nifty500_aliases = aliases
@@ -807,6 +864,25 @@ def cleanup_database():
         print(f"Database cleanup error: {e}")
 
 
+_BOARD_NOTICE_RE = re.compile(
+    r'\bboard\s+meeting\b'
+    r'|\bboard\s+(?:to|will|shall)\s+(?:consider|approve|discuss|evaluate|review)\b',
+    re.IGNORECASE,
+)
+
+
+def is_board_meeting_notice(headline_text):
+    """True for advance board-meeting notices (not actual board decisions), e.g.
+    "Ideaforge Technology Board Meeting on Nov 2, 2026",
+    "Engineers India Ltd: Board to Consider Interim Dividend FY27".
+    "Avalon Technologies Board Approves Director Appointments" is NOT a notice.
+    Nuvama sometimes joins several items with "||"; such a line is only treated
+    as a notice if every item in it is one, so real news isn't dropped with it.
+    """
+    parts = [p for p in headline_text.split('||') if p.strip()]
+    return bool(parts) and all(_BOARD_NOTICE_RE.search(p) for p in parts)
+
+
 def is_results_headline(headline_text, category=""):
     """
     Detect if a headline is a results/earnings headline.
@@ -816,8 +892,8 @@ def is_results_headline(headline_text, category=""):
     """
     # Check category tag first (may be unreliable)
     cat = category.strip().lower()
-    if cat in ("result", "results", "earning", "earnings"):
-        return True
+    if cat in ("result", "results", "earning", "earnings") or "result" in cat:
+        return True  # incl. Stockwatch's "Quarterly Result" category
 
     # Content-based detection: look for earnings/results patterns in headline text
     text_lower = headline_text.lower()
@@ -844,6 +920,11 @@ def is_results_headline(headline_text, category=""):
         r'\bcons net profit\b',
         r'\bsl net loss\b',
         r'\bcons net loss\b',
+        # Results announcements without figures, e.g.
+        # "Bansal Wire Industries Declares Un-Audited Financial Results for ..."
+        r'\bfinancial results?\b',
+        r'\b(?:un-?\s?audited|audited)\b.*\bresults?\b',
+        r'\b(?:quarterly|half[- ]yearly|annual|q[1-4](?:\s*fy\s*\d+)?)\s+results?\b',
     ]
     for pattern in results_patterns:
         if re.search(pattern, text_lower):
@@ -1142,7 +1223,51 @@ def save_context_memory(memory):
         log_error("save_context_memory", str(e), f"Memory entries: {len(memory)}")
 
 
-def is_context_duplicate(headline_text, context_memory, source=""):
+def _content_words(text):
+    return set(w for w in canonicalize_for_context(text).split()
+               if w not in STOP_WORDS and len(w) > 2)
+
+
+def _company_name_words():
+    """All words that make up a known company name/symbol (e.g. "patel", "retail").
+    Excluded when comparing key words, so a shared company name alone can't
+    make two different stories look alike."""
+    _, aliases = load_nifty500_companies()
+    words = set()
+    for alias in aliases:
+        words.update(alias.split())
+    return words
+
+
+def description_containment(headline_a, desc_a, headline_b, desc_b):
+    """
+    Catch same-company duplicates that are worded differently, using the
+    Stockwatch description. E.g. Nuvama "Patel Retail Chooses Two New Sites For
+    Future Stores In Maharashtra: Ghoti In Nashik..." vs Stockwatch "Patel Retail
+    Finalises 2 New Store Locations in Maharashtra" (description names Ghoti,
+    Nashik, Mangaon/Mahad, Raigad). Returns the fraction of one headline's
+    content words found in the other item's headline + description, or 0.0 if
+    neither side has a description, the companies differ, or too few words match.
+    """
+    if not desc_a and not desc_b:
+        return 0.0
+    if company_alias_overlap(headline_a, headline_b) < 0.5:
+        return 0.0
+
+    name_words = _company_name_words()
+    best = 0.0
+    for head, other_full in ((headline_a, f"{headline_b} {desc_b}"),
+                             (headline_b, f"{headline_a} {desc_a}")):
+        words = _content_words(head) - name_words
+        if not words:
+            continue
+        common = words & _content_words(other_full)
+        if len(common) >= 4:
+            best = max(best, len(common) / len(words))
+    return best
+
+
+def is_context_duplicate(headline_text, context_memory, source="", description=""):
     """
     Check if headline is a contextual duplicate of a recent alert from the OTHER source.
     Only compares cross-source (Nuvama vs Stockwatch), not within the same source.
@@ -1162,6 +1287,10 @@ def is_context_duplicate(headline_text, context_memory, source=""):
 
         stored_headline = entry.get('headline', '')
         score = contextual_similarity_score(headline_text, stored_headline)
+        # Same company + most key words appear in the other side's description
+        if description_containment(headline_text, description, stored_headline,
+                                   entry.get('description', '')) >= DESCRIPTION_DEDUP_THRESHOLD:
+            score = max(score, 1.0)
         if score > best_score:
             best_score = score
             best_match = stored_headline
@@ -1170,11 +1299,12 @@ def is_context_duplicate(headline_text, context_memory, source=""):
     return is_dup, best_score, best_match
 
 
-def add_to_context_memory(context_memory, headline_text, source, company="", embedding=None):
+def add_to_context_memory(context_memory, headline_text, source, company="", embedding=None, description=""):
     """Add a sent headline to contextual memory for future dedup"""
     canon = canonicalize_for_context(headline_text)
     entry = {
         'headline': headline_text,
+        'description': description,
         'canonical': canon,
         'tokens': canon.split(),
         'timestamp': datetime.now(IST).isoformat(),
@@ -1294,13 +1424,18 @@ def check_and_notify():
         if not should_send_alert:
             continue
 
+        # --- Board meeting notice filter ---
+        if EXCLUDE_BOARD_MEETING_NOTICES and is_board_meeting_notice(headline_text):
+            print(f"Filtered [Board Meeting Notice] [{source}]: {headline_text[:70]}...")
+            continue
+
         # --- Results/earnings filter ---
         if EXCLUDE_RESULTS_ALERTS and is_results_headline(headline_text, category):
             print(f"Filtered [Result] [{source}]: {headline_text[:70]}...")
             continue
 
         # --- LAYER B: Contextual dedup ---
-        is_dup, score, matched = is_context_duplicate(headline_text, context_memory, source)
+        is_dup, score, matched = is_context_duplicate(headline_text, context_memory, source, description)
         if is_dup:
             print(f"Filtered [Cross-Source Dup {score:.2f}] [{source}]: {headline_text[:60]}...")
             print(f"  Matched: {matched[:60]}...")
@@ -1310,7 +1445,7 @@ def check_and_notify():
         print(f"Sending [{source}]: {headline_text[:70]}...")
         if send_telegram(headline_text, source, company, description):
             embedding = get_embedding(headline_text) if ENABLE_EMBEDDING_DEDUP else None
-            context_memory = add_to_context_memory(context_memory, headline_text, source, company, embedding)
+            context_memory = add_to_context_memory(context_memory, headline_text, source, company, embedding, description)
             time.sleep(2)
 
     # Persist state
@@ -1329,6 +1464,7 @@ print(f"Checking every {CHECK_INTERVAL_SECONDS} seconds")
 print(f"IST Timezone: UTC+5:30")
 print(f"Stockwatch feed: {ENABLE_STOCKWATCH}")
 print(f"Exclude results alerts: {EXCLUDE_RESULTS_ALERTS}")
+print(f"Exclude board meeting notices: {EXCLUDE_BOARD_MEETING_NOTICES}")
 print(f"Embedding dedup: {ENABLE_EMBEDDING_DEDUP}")
 print(f"Contextual dedup threshold: {CONTEXTUAL_DEDUP_THRESHOLD}")
 print("=" * 60 + "\n")
@@ -1400,11 +1536,13 @@ for h in initial_headlines:
 
     # Send alert only if truly new and newer than last check
     if is_new and should_alert:
-        if EXCLUDE_RESULTS_ALERTS and is_results_headline(headline_text, category):
+        if EXCLUDE_BOARD_MEETING_NOTICES and is_board_meeting_notice(headline_text):
+            print(f"[FILTERED] Board meeting notice skipped [{source}]: {headline_text[:60]}...")
+        elif EXCLUDE_RESULTS_ALERTS and is_results_headline(headline_text, category):
             print(f"[FILTERED] Result skipped [{source}]: {headline_text[:60]}...")
         else:
             # Layer B: Contextual dedup
-            is_dup, score, matched = is_context_duplicate(headline_text, initial_context_memory, source)
+            is_dup, score, matched = is_context_duplicate(headline_text, initial_context_memory, source, description)
             if is_dup:
                 print(f"[Cross-Source Dup {score:.2f}] [{source}]: {headline_text[:60]}...")
             else:
@@ -1412,7 +1550,7 @@ for h in initial_headlines:
                 if send_telegram(headline_text, source, company, description):
                     embedding = get_embedding(headline_text) if ENABLE_EMBEDDING_DEDUP else None
                     initial_context_memory = add_to_context_memory(
-                        initial_context_memory, headline_text, source, company, embedding
+                        initial_context_memory, headline_text, source, company, embedding, description
                     )
                     time.sleep(2)
 
