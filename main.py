@@ -43,13 +43,23 @@ STOCKWATCH_LOOKBACK_DAYS = int(os.getenv("STOCKWATCH_LOOKBACK_DAYS", "2"))
 STOCKWATCH_MAX_ITEMS = int(os.getenv("STOCKWATCH_MAX_ITEMS", "100"))
 CHECK_INTERVAL_SECONDS = 60
 
-# RESULTS FILTER - skip earnings/results headlines from Telegram (still saved to dashboard)
+# RESULTS FILTER (Nuvama only) - skip earnings/results headlines from Telegram (still saved to dashboard)
 EXCLUDE_RESULTS_ALERTS = os.getenv("EXCLUDE_RESULTS_ALERTS", "false").lower() == "true"
-# Skip advance board-meeting notices ("Board Meeting on <date>", "Board to Consider ...")
+# BOARD MEETING FILTER (Nuvama only) - skip advance notices ("Board Meeting on <date>", "Board to Consider ...")
 EXCLUDE_BOARD_MEETING_NOTICES = os.getenv("EXCLUDE_BOARD_MEETING_NOTICES", "true").lower() == "true"
 
 # STOCKWATCH FEED TOGGLE
 ENABLE_STOCKWATCH = os.getenv("ENABLE_STOCKWATCH", "true").lower() == "true"
+
+# STOCKWATCH CATEGORY FILTER: comma-separated categories NOT sent to Telegram
+# (still saved to the dashboard). Matched case-insensitively as part of the
+# category name, so "result" covers "Quarterly Result" and "agm" "AGM/EGM".
+STOCKWATCH_BLOCKED_CATEGORIES = [
+    c.strip().lower() for c in os.getenv(
+        "STOCKWATCH_BLOCKED_CATEGORIES",
+        "Result, Board Meeting, ESG, Corporate Action, Dividend, AGM",
+    ).split(",") if c.strip()
+]
 
 # STOCKWATCH COMPANY FILTER (matches against both CSVs combined)
 NIFTY500_CSV_PATH = os.getenv("NIFTY500_CSV_PATH", "nifty500_companies.csv")
@@ -255,6 +265,8 @@ def send_telegram(headline_text, source="", company="", description=""):
 # Persistent Nuvama browser: launched once and reused across checks (the page
 # is just reloaded each cycle) so a Chrome window doesn't pop in and out of the
 # taskbar every minute. Any failure tears it down and the next check relaunches.
+# NUVAMA_HIDDEN_BROWSER=false falls back to an off-screen visible browser.
+NUVAMA_HIDDEN_BROWSER = os.getenv("NUVAMA_HIDDEN_BROWSER", "true").lower() == "true"
 _nv_playwright = None
 _nv_browser = None
 _nv_page = None
@@ -279,19 +291,34 @@ def _get_nuvama_page():
         return _nv_page
     _close_nuvama_browser()
     _nv_playwright = sync_playwright().start()
-    # Nuvama's SPA detects headless Chromium and never loads the news
-    # feed (only the page shell renders). A headed browser loads it
-    # instantly. Launch headed but positioned far off-screen so no
-    # visible window disrupts the desktop.
-    _nv_browser = _nv_playwright.chromium.launch(
-        headless=False,
-        args=[
-            "--window-position=-32000,-32000",
-            "--window-size=1366,900",
-            "--disable-blink-features=AutomationControlled",
-        ],
-    )
-    _nv_page = _nv_browser.new_page()
+    if NUVAMA_HIDDEN_BROWSER:
+        # Nuvama's SPA never loads the news feed for the old headless shell or
+        # for a "HeadlessChrome" user agent. Chrome's new headless mode
+        # (channel="chromium") with a normal Chrome user agent loads it fine,
+        # with no window or taskbar icon at all.
+        _nv_browser = _nv_playwright.chromium.launch(
+            channel="chromium",
+            headless=True,
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+        major = _nv_browser.version.split('.')[0]
+        _nv_page = _nv_browser.new_page(
+            user_agent=(f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                        f"(KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36"),
+            viewport={"width": 1366, "height": 900},
+        )
+    else:
+        # Fallback: headed browser positioned far off-screen (shows a
+        # taskbar icon while running).
+        _nv_browser = _nv_playwright.chromium.launch(
+            headless=False,
+            args=[
+                "--window-position=-32000,-32000",
+                "--window-size=1366,900",
+                "--disable-blink-features=AutomationControlled",
+            ],
+        )
+        _nv_page = _nv_browser.new_page()
     return _nv_page
 
 
@@ -864,6 +891,14 @@ def cleanup_database():
         print(f"Database cleanup error: {e}")
 
 
+def is_blocked_stockwatch_category(source, category):
+    """True if a Stockwatch item's category is in STOCKWATCH_BLOCKED_CATEGORIES."""
+    if source != 'STOCKWATCH':
+        return False
+    cat = (category or '').strip().lower()
+    return bool(cat) and any(b in cat for b in STOCKWATCH_BLOCKED_CATEGORIES)
+
+
 _BOARD_NOTICE_RE = re.compile(
     r'\bboard\s+meeting\b'
     r'|\bboard\s+(?:to|will|shall)\s+(?:consider|approve|discuss|evaluate|review)\b',
@@ -1424,13 +1459,18 @@ def check_and_notify():
         if not should_send_alert:
             continue
 
-        # --- Board meeting notice filter ---
-        if EXCLUDE_BOARD_MEETING_NOTICES and is_board_meeting_notice(headline_text):
+        # --- Stockwatch category filter (Stockwatch uses this instead of the keyword filters below) ---
+        if is_blocked_stockwatch_category(source, category):
+            print(f"Filtered [Category: {category}] [{source}]: {headline_text[:70]}...")
+            continue
+
+        # --- Board meeting notice filter (Nuvama only) ---
+        if EXCLUDE_BOARD_MEETING_NOTICES and source != 'STOCKWATCH' and is_board_meeting_notice(headline_text):
             print(f"Filtered [Board Meeting Notice] [{source}]: {headline_text[:70]}...")
             continue
 
-        # --- Results/earnings filter ---
-        if EXCLUDE_RESULTS_ALERTS and is_results_headline(headline_text, category):
+        # --- Results/earnings filter (Nuvama only) ---
+        if EXCLUDE_RESULTS_ALERTS and source != 'STOCKWATCH' and is_results_headline(headline_text, category):
             print(f"Filtered [Result] [{source}]: {headline_text[:70]}...")
             continue
 
@@ -1463,8 +1503,9 @@ print("=" * 60)
 print(f"Checking every {CHECK_INTERVAL_SECONDS} seconds")
 print(f"IST Timezone: UTC+5:30")
 print(f"Stockwatch feed: {ENABLE_STOCKWATCH}")
-print(f"Exclude results alerts: {EXCLUDE_RESULTS_ALERTS}")
-print(f"Exclude board meeting notices: {EXCLUDE_BOARD_MEETING_NOTICES}")
+print(f"Stockwatch blocked categories: {', '.join(STOCKWATCH_BLOCKED_CATEGORIES) or 'none'}")
+print(f"Exclude results alerts (Nuvama): {EXCLUDE_RESULTS_ALERTS}")
+print(f"Exclude board meeting notices (Nuvama): {EXCLUDE_BOARD_MEETING_NOTICES}")
 print(f"Embedding dedup: {ENABLE_EMBEDDING_DEDUP}")
 print(f"Contextual dedup threshold: {CONTEXTUAL_DEDUP_THRESHOLD}")
 print("=" * 60 + "\n")
@@ -1536,9 +1577,11 @@ for h in initial_headlines:
 
     # Send alert only if truly new and newer than last check
     if is_new and should_alert:
-        if EXCLUDE_BOARD_MEETING_NOTICES and is_board_meeting_notice(headline_text):
+        if is_blocked_stockwatch_category(source, category):
+            print(f"[FILTERED] Category {category} skipped [{source}]: {headline_text[:60]}...")
+        elif EXCLUDE_BOARD_MEETING_NOTICES and source != 'STOCKWATCH' and is_board_meeting_notice(headline_text):
             print(f"[FILTERED] Board meeting notice skipped [{source}]: {headline_text[:60]}...")
-        elif EXCLUDE_RESULTS_ALERTS and is_results_headline(headline_text, category):
+        elif EXCLUDE_RESULTS_ALERTS and source != 'STOCKWATCH' and is_results_headline(headline_text, category):
             print(f"[FILTERED] Result skipped [{source}]: {headline_text[:60]}...")
         else:
             # Layer B: Contextual dedup
